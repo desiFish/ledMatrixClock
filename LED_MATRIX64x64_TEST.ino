@@ -39,7 +39,8 @@
 // ============================================================================
 // SETUP - Initialize hardware, display, and connectivity
 // ============================================================================
-
+bool timeNeedsUpdate = false;
+String errorFlag = "";
 void setup()
 {
   Serial.begin(9600);
@@ -93,89 +94,59 @@ void setup()
   // ---- Initialize RTC and Synchronize Time ----
   if (!rtc.begin())
   {
+    errorFlag = "RTC ERROR";
     Serial.println("Couldn't find RTC");
   }
   else
   {
     // Get current RTC time
     DateTime now = rtc.now();
-    bool timeNeedsUpdate = false;
 
     // Check if RTC is not initialized (year = 1970) or RTC is not running
     if (now.year() == 1970 || !rtc.isrunning())
     {
-      Serial.println("[DEBUG] RTC not initialized or not running, marking for update");
+      Serial.println("RTC not initialized or not running, marking for update");
       timeNeedsUpdate = true;
-    }
-
-    // Get current day
-    // byte currentDay = now.day();
-
-    // Calculate days passed since last check
-    // byte daysPassed = (currentDay - lastCheckedDay + 31) % 31;
-
-    // Check if update is needed: timeNeedsUpdate flag OR 15+ days passed
-    if (timeNeedsUpdate) // || daysPassed >= 15)
-    {
-      Serial.println("[INFO] Time update needed - attempting NTP sync");
-      if (rtcTimeUpdater())
-      {
-        Serial.println("[INFO] Time updated successfully from NTP");
-        timeNeedsUpdate = false;
-      }
-      else
-      {
-        Serial.println("[ERROR] Time update failed");
-      }
-      // Update lastCheckedDay regardless of success (to avoid constant attempts)
-      // lastCheckedDay = currentDay;
-    }
-    else
-    {
-      Serial.println("[INFO] Time already updated, no action needed");
     }
   }
 
   if (!temp117.begin()) // Initialize TMP117 and verify the device is present
   {
-    Serial.println("TMP117 init failed. Halting.");
-    while (true)
-    {
-      delay(1000);
-    }
+    errorFlag = "TMP ERROR";
+    Serial.println("TMP117 init failed.");
   }
+  else
+  {
+    temp117.setShutdownMode();
+    Serial.println("TMP117 initialized successfully.");
 
-  temp117.setShutdownMode();
-  Serial.println("TMP117 initialized successfully.");
-
-  // Start the first one-shot conversion immediately
-  lastRequestTime = millis() - readInterval;
+    // Start the first one-shot conversion immediately
+    lastRequestTime = millis() - readInterval;
+  }
 
   // Initialize INA219 and verify the device is present
   if (!ina.begin(&Wire))
   {
-    // if (!ina.beginStrict(&Wire, 21, 22, 400000)) {
+    errorFlag = "INA ERROR";
     Serial.println(F("ERROR: INA219 @0x40 not found"));
-    while (1)
-    {
-      delay(1000);
-    }
   }
+  else
+  {
+    // Config: 32V, ±320mV, 12-bit x16 avg, continuous shunt+bus
+    bool range16V = true; // true: 16V, false: 32V
+    uint8_t pga = 3;
+    uint8_t badc = 0x0B;
+    uint8_t sadc = 0x0B;
+    uint8_t mode = 0x07;
+    ina.configure(range16V, pga, badc, sadc, mode);
 
-  // Config: 32V, ±320mV, 12-bit x16 avg, continuous shunt+bus
-  bool range16V = true; // true: 16V, false: 32V
-  uint8_t pga = 3;
-  uint8_t badc = 0x0B;
-  uint8_t sadc = 0x0B;
-  uint8_t mode = 0x07;
-  ina.configure(range16V, pga, badc, sadc, mode);
+    // Auto calibration: set per your shunt & range
+    float maxExpected_A = 1.0f;
+    float shunt_Ohms = 0.1f;
+    ina.calibrateAuto(maxExpected_A, shunt_Ohms);
 
-  // Auto calibration: set per your shunt & range
-  float maxExpected_A = 1.0f;
-  float shunt_Ohms = 0.1f;
-  ina.calibrateAuto(maxExpected_A, shunt_Ohms);
-
-  Serial.println(F("Single INA219 ready.\n"));
+    Serial.println(F("Single INA219 ready.\n"));
+  }
   // LIGHT SENSOR
   if (lightMeter.begin(BH1750::ONE_TIME_HIGH_RES_MODE_2))
   {
@@ -183,6 +154,7 @@ void setup()
   }
   else
   {
+    errorFlag = "BHT ERROR";
     Serial.println(F("Error initialising BH1750"));
   }
 
@@ -198,6 +170,8 @@ void setup()
 }
 
 float tempC = 0.0f;
+byte currentDay = 0;
+byte lastCheckedDay = 0;
 
 // ============================================================================
 // CORE 0 TASK - Secondary loop for dual-core operation
@@ -302,6 +276,16 @@ void loop1(void *pvParameters)
         float power_mW = ina.readPower();
         bool ovf = ina.overflow();
 
+        // Check for voltage errors
+        if (vBus_V < 4.7 || vBus_V > 5.5 || ovf)
+        {
+          errorFlag = "VOLT " + String(vBus_V, 2);
+        }
+        else if (errorFlag.startsWith("VOLT"))
+        {
+          errorFlag = ""; // Clear voltage error if voltage is now normal
+        }
+
         Serial.print(F("Bus: "));
         Serial.print(vBus_V, 3);
         Serial.print(F(" V"));
@@ -328,6 +312,27 @@ void loop1(void *pvParameters)
     {
       Serial.println("Switch2 pressed");
     }
+
+    // Calculate days passed since last check
+    byte daysPassed = (currentDay - lastCheckedDay + 31) % 31;
+
+    // Check if update is needed: timeNeedsUpdate flag OR 15+ days passed
+    if (timeNeedsUpdate || daysPassed >= 5)
+    {
+      Serial.println("[INFO] Time update needed - attempting NTP sync");
+      if (rtcTimeUpdater())
+      {
+        Serial.println("[INFO] Time updated successfully from NTP");
+        timeNeedsUpdate = false;
+      }
+      else
+      {
+        Serial.println("[ERROR] Time update failed");
+      }
+      // Update lastCheckedDay regardless of success (to avoid constant attempts)
+      lastCheckedDay = currentDay;
+    }
+
     delay(50);
   }
 }
@@ -339,67 +344,93 @@ void loop1(void *pvParameters)
 bool x = true;
 void loop()
 {
-  // ---- Display Blinking Colon Effect ----
-  static unsigned long lastBlinkTime = 0;
-  static boolean blinkState = false;
-  unsigned long currentTime = millis();
-
-  if (currentTime - lastBlinkTime >= 800)
+  if (!timeNeedsUpdate)
   {
-    blinkState = !blinkState;
-    lastBlinkTime = currentTime;
-  }
+    // ---- Display Blinking Colon Effect ----
+    static unsigned long lastBlinkTime = 0;
+    static boolean blinkState = false;
+    unsigned long currentTime = millis();
 
-  if (blinkState)
-  {
-    display.fillRect(22, 26, 2, 2, myWHITE);
-    display.fillRect(22, 35, 2, 2, myWHITE);
+    if (currentTime - lastBlinkTime >= 800)
+    {
+      blinkState = !blinkState;
+      lastBlinkTime = currentTime;
+    }
+
+    if (blinkState)
+    {
+      display.fillRect(22, 26, 2, 2, myWHITE);
+      display.fillRect(22, 35, 2, 2, myWHITE);
+    }
+    else
+    {
+      display.fillRect(22, 26, 2, 2, myBLACK);
+      display.fillRect(22, 35, 2, 2, myBLACK);
+    }
+
+    // ---- Read and Format Time Data ----
+    DateTime now = rtc.now();
+    byte tempHour = now.twelveHour(); // Get the hour in 12-hour format
+
+    // byte temp = int(rtc.getTemperature()); // Get the temperature in Celsius, rounded to the nearest integer
+    currentDay = now.day();
+
+    String dateString = padNum(currentDay) + "/" + padNum(now.month()) + "/" + String(now.year()); // Format date string
+
+    // ---- Update Display Every Second ----
+    if (x || now.second() == 0)
+    {
+      x = false;
+      display.clearDisplay();
+
+      // Display date
+      display.setFont(NULL);
+      display.setTextColor(myGREEN);
+      display.setCursor(3, 7);
+      display.print(dateString);
+
+      // Display time
+      display.setFont(&FreeSans9pt7b);
+      display.setTextSize(1);
+      display.setTextColor(myWHITE);
+      display.setCursor(0, 37);
+      display.print(padNum(tempHour));
+
+      display.setCursor(26, 37);
+      display.print(padNum(now.minute()));
+      display.setFont(NULL);
+      display.print(now.isPM() ? " PM" : " AM");
+
+      // Display error if present, else day and temperature
+      if (errorFlag.length() > 0)
+      {
+        display.setTextColor(myRED);
+        display.setCursor(3, 50);
+        display.print(errorFlag);
+      }
+      else
+      {
+        display.setTextColor(myYELLOW);
+        display.setCursor(3, 50);
+        display.print(daysOfTheWeek[now.dayOfTheWeek()]);
+        display.setCursor(30, 50);
+        display.print(tempC, 1); // Display temperature with 1 decimal place
+        display.print("C");
+      }
+    }
   }
   else
   {
-    display.fillRect(22, 26, 2, 2, myBLACK);
-    display.fillRect(22, 35, 2, 2, myBLACK);
-  }
-
-  // ---- Read and Format Time Data ----
-  DateTime now = rtc.now();
-  byte tempHour = now.twelveHour(); // Get the hour in 12-hour format
-
-  // byte temp = int(rtc.getTemperature()); // Get the temperature in Celsius, rounded to the nearest integer
-
-  String dateString = padNum(now.day()) + "/" + padNum(now.month()) + "/" + String(now.year()); // Format date string
-
-  // ---- Update Display Every Second ----
-  if (x || now.second() == 0)
-  {
-    x = false;
     display.clearDisplay();
-
-    // Display date
     display.setFont(NULL);
-    display.setTextColor(myGREEN);
-    display.setCursor(3, 7);
-    display.print(dateString);
-
-    // Display time
-    display.setFont(&FreeSans9pt7b);
-    display.setTextSize(1);
-    display.setTextColor(myWHITE);
-    display.setCursor(0, 37);
-    display.print(padNum(tempHour));
-
-    display.setCursor(26, 37);
-    display.print(padNum(now.minute()));
-    display.setFont(NULL);
-    display.print(now.isPM() ? " PM" : " AM");
-
-    // Display day and temperature
-    display.setTextColor(myYELLOW);
-    display.setCursor(3, 50);
-    display.print(daysOfTheWeek[now.dayOfTheWeek()]);
-    display.setCursor(30, 50);
-    display.print(tempC, 1); // Display temperature with 1 decimal place
-    display.print("C");
+    display.setTextColor(myRED);
+    display.setCursor(0, 0);
+    display.print("RTC UPDATE");
+    display.setCursor(0, 10);
+    display.print("IN");
+    display.setCursor(0, 20);
+    display.print("PROGRESS...");
+    delay(1000);
   }
 
   delay(100);
