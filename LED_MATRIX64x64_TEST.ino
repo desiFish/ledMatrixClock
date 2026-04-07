@@ -25,22 +25,27 @@
 // #define PxMATRIX_double_buffer true              // Extra buffer for smooth drawing
 
 // ============================================================================
-// SOFTWARE VERSION
-// ============================================================================
-
-#define SW_VERSION "1.0.0-beta"
-
-// ============================================================================
 // INCLUDE CONFIGURATION AND HELPER FUNCTIONS
 // ============================================================================
 
 #include "config.h"
 
 // ============================================================================
+// ABOUT THIS PROGRAM
+// ============================================================================
+
+// This sketch runs a 64x64 LED matrix clock with automatic time updates,
+// temperature monitoring, power measurement, and adaptive brightness.
+// The display shows the current date, time, day of the week, and temperature.
+// If something goes wrong during startup or the power bus gets out of range,
+// the panel displays a simple error message instead of normal data.
+
+// ============================================================================
 // SETUP - Initialize hardware, display, and connectivity
 // ============================================================================
-bool timeNeedsUpdate = false;
-String errorFlag = "";
+// The setup() function only runs once, and it brings the hardware online.
+// This includes WiFi, the display panel, the clock chip, the temperature sensor,
+// the power sensor, and the light sensor.
 void setup()
 {
   Serial.begin(9600);
@@ -54,14 +59,13 @@ void setup()
   delay(200);
   digitalWrite(buzzerPin, LOW);
 
-  // ---- Initialize WiFi ----
-  WiFi.begin();
-  while (WiFi.status() != WL_CONNECTED)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("SonyBraviaX400", "66227617975PsA#");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
-    delay(1000);
+    delay(200);
   }
-  Serial.println("Connected to WiFi");
-
   // ---- Initialize Display ----
   // Define your display layout here, e.g. 1/8 step, and optional SPI pins begin(row_pattern, CLK, MOSI, MISO, SS)
   display.begin(32);
@@ -84,11 +88,12 @@ void setup()
   display.print("CLOCK");
   display_update_enable(true);
 
-  delay(500);
+  delay(1000);
+
   for (int i = 0; i < 3; i++)
   {
     display.fillRect(0, 0, 64, 64, myCOLORS[i]);
-    delay(100);
+    delay(500);
   }
 
   // ---- Initialize RTC and Synchronize Time ----
@@ -170,13 +175,14 @@ void setup()
 }
 
 float tempC = 0.0f;
-byte currentDay = 0;
-byte lastCheckedDay = 0;
 
 // ============================================================================
-// CORE 0 TASK - Secondary loop for dual-core operation
 // ============================================================================
-
+// CORE 0 TASK - Secondary loop for background sensor updates
+// ============================================================================
+// This task runs on the second core and handles the slower sensor loops.
+// It reads temperature, adjusts display brightness, checks the power bus,
+// and decides when the clock needs a time sync.
 void loop1(void *pvParameters)
 {
   for (;;)
@@ -223,9 +229,9 @@ void loop1(void *pvParameters)
       // Read lux (may be stale if timeout triggered)
       lux = lightMeter.readLightLevel();
 
-      // Map lux to target brightness
-      byte val1 = constrain(lux, 1, 120);            // Limit lux to 1-120 for mapping
-      targetBrightness = map(val1, 1, 120, 10, 100); // Map to 40-50 range (max brightness = 50)
+      // Map lux to target brightness. 10 is dim, 50 is the brightest value we allow.
+      byte val1 = constrain(lux, 1, 120);           // Keep lux in the expected range
+      targetBrightness = map(val1, 1, 120, 10, 50); // Map full light range to 10-50 brightness
 
       Serial.print("[DEBUG] Lux = ");
       Serial.print(lux);
@@ -306,19 +312,24 @@ void loop1(void *pvParameters)
     if (digitalRead(switch1Pin) == HIGH)
     {
       Serial.println("Switch1 pressed");
+      delay(200); // simple debounce
     }
 
     if (digitalRead(switch2Pin) == HIGH)
     {
       Serial.println("Switch2 pressed");
+      delay(200); // simple debounce
     }
 
-    // Calculate days passed since last check
+    // Calculate how many days have passed since the last time sync.
+    // Using the day-of-month value keeps this simple and avoids a full
+    // date-time difference calculation.
     byte daysPassed = (currentDay - lastCheckedDay + 31) % 31;
 
-    // Check if update is needed: timeNeedsUpdate flag OR 15+ days passed
+    // If the clock was never synced, or five days have gone by, do an update.
     if (timeNeedsUpdate || daysPassed >= 5)
     {
+      timeNeedsUpdate = true; // Set this early to prevent multiple attempts in the same loop
       Serial.println("[INFO] Time update needed - attempting NTP sync");
       if (rtcTimeUpdater())
       {
@@ -331,8 +342,8 @@ void loop1(void *pvParameters)
       }
       // Update lastCheckedDay regardless of success (to avoid constant attempts)
       lastCheckedDay = currentDay;
+      x = true; // Force display refresh on next loop to show updated time or error
     }
-
     delay(50);
   }
 }
@@ -340,8 +351,8 @@ void loop1(void *pvParameters)
 // ============================================================================
 // MAIN LOOP - Display update and time rendering
 // ============================================================================
-
-bool x = true;
+// This is the frame loop for the LED matrix. It redraws the clock and
+// updates the blinking colon, while the background task handles sensors and sync.
 void loop()
 {
   if (!timeNeedsUpdate)
@@ -401,7 +412,8 @@ void loop()
       display.setFont(NULL);
       display.print(now.isPM() ? " PM" : " AM");
 
-      // Display error if present, else day and temperature
+      // If something went wrong while initializing hardware or during
+      // voltage monitoring, show that error instead of the normal footer.
       if (errorFlag.length() > 0)
       {
         display.setTextColor(myRED);
@@ -415,6 +427,9 @@ void loop()
         display.print(daysOfTheWeek[now.dayOfTheWeek()]);
         display.setCursor(30, 50);
         display.print(tempC, 1); // Display temperature with 1 decimal place
+        display.setCursor(52, 45);
+        display.print(".");
+        display.setCursor(57, 50);
         display.print("C");
       }
     }
@@ -430,9 +445,7 @@ void loop()
     display.print("IN");
     display.setCursor(0, 20);
     display.print("PROGRESS...");
-    delay(1000);
   }
-
   delay(100);
 }
 
@@ -451,14 +464,10 @@ bool rtcTimeUpdater()
     return false;
   }
 
-  // ---- Validate WiFi Connection ----
-  // Early WiFi validation - check connection status first (WL_CONNECTED = 3)
-  int wifiStatus = WiFi.status();
-  if (wifiStatus != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED)
   {
     char buffer[100];
-    sprintf(buffer, "[WIFI_ERROR] WiFi not connected. Status: %d (need 3). IP: %s", wifiStatus, WiFi.localIP().toString().c_str());
-
+    sprintf(buffer, "[WIFI_ERROR] WiFi not connected. Status: %d (need 3). IP: %s", WiFi.status(), WiFi.localIP().toString().c_str());
     Serial.println(buffer);
     return false;
   }

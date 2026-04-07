@@ -1,8 +1,11 @@
 /*
-  config.h - LED Matrix Display Configuration and Helper Functions
+  config.h - Shared hardware setup and helper objects
 
-  This file contains all hardware configuration, pin definitions, color definitions,
-  and display management functions for the LED Matrix 64x64 counter.
+  This file keeps the display wiring, shared sensor objects, and global state
+  together so the main sketch can stay focused on the clock behavior.
+
+  Put things here when they are part of the hardware or shared state,
+  not when they belong to the main program flow.
 */
 
 #ifndef CONFIG_H
@@ -133,22 +136,38 @@ TaskHandle_t loop1Task;
 String ntpServer = "";
 
 // ============================================================================
+// APPLICATION STATE
+// ============================================================================
+
+// Software version for beta builds
+#define SW_VERSION "1.0.0-beta"
+
+// Flags and counters that track application state across the sketch
+bool timeNeedsUpdate = false;
+String errorFlag = "";
+byte currentDay = 0;
+byte lastCheckedDay = 0;
+bool x = true; // Used to force display refresh when time sync status changes
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
 /**
- * Pad a number with leading zero if less than 10
- * @param num The number to pad
- * @return String with padded number (e.g., 5 becomes "05")
+ * Pad a number with a leading zero when it is less than 10.
+ * This makes time and date strings look consistent.
  */
 String padNum(int num)
 {
     return (num < 10 ? "0" : "") + String(num);
 }
 
+// ============================================================================// SENSOR AND ACTUATOR OBJECTS
+// ============================================================================
+
 TMP117 temp117;
-INA219_7Semi ina(0x40);  // single device @ 0x40
-BH1750 lightMeter(0x23); // Initalize light sensor
+INA219_7Semi ina(0x40);  // power/current sensor at I2C address 0x40
+BH1750 lightMeter(0x23); // light sensor at I2C address 0x23
 
 const int buzzerPin = 33;
 const int switch1Pin = 25;
