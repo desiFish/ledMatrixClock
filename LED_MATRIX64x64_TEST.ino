@@ -1,5 +1,5 @@
 /*
-  LED_MATRIX64x64_TEST.ino
+  LED_MATRIX64x64_TEST.ino - Digital Clock for 64x64 LED Matrix
 
   Copyright (C) 2025-2026 desiFish
 
@@ -15,115 +15,53 @@
 
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+  OPTIONAL CONFIGURATION:
+  Uncomment these lines to customize display behavior
 */
 
-// This is how many color levels the display shows - the more the slower the update
-// #define PxMATRIX_COLOR_DEPTH 4
+// #define PxMATRIX_COLOR_DEPTH 4                   // Color levels (more = slower update)
+// #define PxMATRIX_SPI_FREQUENCY 20000000          // SPI speed (reduce if noisy)
+// #define PxMATRIX_double_buffer true              // Extra buffer for smooth drawing
 
-// Defines the speed of the SPI bus (reducing this may help if you experience noisy images)
-// #define PxMATRIX_SPI_FREQUENCY 20000000
+// ============================================================================
+// SOFTWARE VERSION
+// ============================================================================
 
-// Creates a second buffer for backround drawing (doubles the required RAM)
-// #define PxMATRIX_double_buffer true
+#define SW_VERSION "1.0.0-beta"
 
-#include <PxMatrix.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSerif9pt7b.h>
-#include <Fonts/FreeMono9pt7b.h>
-#include <WiFi.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
-#include <time.h>
-#include "RTClib.h"
+// ============================================================================
+// INCLUDE CONFIGURATION AND HELPER FUNCTIONS
+// ============================================================================
 
-// Pins for LED MATRIX
-#define P_LAT 22
-#define P_A 19
-#define P_B 23
-#define P_C 18
-#define P_D 5
-#define P_E 15
-#define P_OE 16
-hw_timer_t *timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+#include "config.h"
 
-#define matrix_width 64
-#define matrix_height 64
-
-// This defines the 'on' time of the display is us. The larger this number,
-// the brighter the display. If too large the ESP will crash
-uint8_t display_draw_time = 30; // 30-70 is usually fine
-
-PxMATRIX display(64, 64, P_LAT, P_OE, P_A, P_B, P_C, P_D, P_E);
-
-// Some standard colors
-uint16_t myRED = display.color565(255, 0, 0);
-uint16_t myGREEN = display.color565(0, 255, 0);
-uint16_t myBLUE = display.color565(0, 0, 255);
-uint16_t myWHITE = display.color565(255, 255, 255);
-uint16_t myYELLOW = display.color565(255, 255, 0);
-uint16_t myCYAN = display.color565(0, 255, 255);
-uint16_t myMAGENTA = display.color565(255, 0, 255);
-uint16_t myBLACK = display.color565(0, 0, 0);
-
-uint16_t myCOLORS[8] = {myRED, myGREEN, myBLUE, myWHITE, myYELLOW, myCYAN, myMAGENTA, myBLACK};
-
-void IRAM_ATTR display_updater()
-{
-  // Increment the counter and set the time of ISR
-  portENTER_CRITICAL_ISR(&timerMux);
-  display.display(display_draw_time);
-  portEXIT_CRITICAL_ISR(&timerMux);
-}
-
-void display_update_enable(bool is_enable)
-{
-  if (is_enable)
-  {
-    timer = timerBegin(1000000);
-    timerAttachInterrupt(timer, &display_updater);
-    timerAlarm(timer, 4000, true, 0);
-    timerStart(timer);
-  }
-  else
-  {
-    timerDetachInterrupt(timer);
-    timerStop(timer);
-  }
-}
-
-RTC_DS1307 rtc;
-char daysOfTheWeek[7][12] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-
-// Define NTP Client to get time
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-
-// Variables to save date and time
-String formattedDate;
-String dayStamp;
-String timeStamp;
-// for creating task attached to CORE 0 of CPU
-TaskHandle_t loop1Task;
-
-String ntpServer = "";
-
-String padNum(int num)
-{
-  return (num < 10 ? "0" : "") + String(num);
-}
+// ============================================================================
+// SETUP - Initialize hardware, display, and connectivity
+// ============================================================================
 
 void setup()
 {
   Serial.begin(9600);
   Wire.begin(32, 27);
-  // Connect to WiFi
+
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(switch1Pin, INPUT);
+  pinMode(switch2Pin, INPUT);
+
+  digitalWrite(buzzerPin, HIGH);
+  delay(200);
+  digitalWrite(buzzerPin, LOW);
+
+  // ---- Initialize WiFi ----
   WiFi.begin();
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(1000);
   }
   Serial.println("Connected to WiFi");
+
+  // ---- Initialize Display ----
   // Define your display layout here, e.g. 1/8 step, and optional SPI pins begin(row_pattern, CLK, MOSI, MISO, SS)
   display.begin(32);
 
@@ -151,6 +89,8 @@ void setup()
     display.fillRect(0, 0, 64, 64, myCOLORS[i]);
     delay(100);
   }
+
+  // ---- Initialize RTC and Synchronize Time ----
   if (!rtc.begin())
   {
     Serial.println("Couldn't find RTC");
@@ -196,6 +136,57 @@ void setup()
     }
   }
 
+  if (!temp117.begin()) // Initialize TMP117 and verify the device is present
+  {
+    Serial.println("TMP117 init failed. Halting.");
+    while (true)
+    {
+      delay(1000);
+    }
+  }
+
+  temp117.setShutdownMode();
+  Serial.println("TMP117 initialized successfully.");
+
+  // Start the first one-shot conversion immediately
+  lastRequestTime = millis() - readInterval;
+
+  // Initialize INA219 and verify the device is present
+  if (!ina.begin(&Wire))
+  {
+    // if (!ina.beginStrict(&Wire, 21, 22, 400000)) {
+    Serial.println(F("ERROR: INA219 @0x40 not found"));
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  // Config: 32V, ±320mV, 12-bit x16 avg, continuous shunt+bus
+  bool range16V = true; // true: 16V, false: 32V
+  uint8_t pga = 3;
+  uint8_t badc = 0x0B;
+  uint8_t sadc = 0x0B;
+  uint8_t mode = 0x07;
+  ina.configure(range16V, pga, badc, sadc, mode);
+
+  // Auto calibration: set per your shunt & range
+  float maxExpected_A = 1.0f;
+  float shunt_Ohms = 0.1f;
+  ina.calibrateAuto(maxExpected_A, shunt_Ohms);
+
+  Serial.println(F("Single INA219 ready.\n"));
+  // LIGHT SENSOR
+  if (lightMeter.begin(BH1750::ONE_TIME_HIGH_RES_MODE_2))
+  {
+    Serial.println(F("BH1750 Advanced begin"));
+  }
+  else
+  {
+    Serial.println(F("Error initialising BH1750"));
+  }
+
+  // ---- Create Core 0 Task ----
   xTaskCreatePinnedToCore(
       loop1,       // Task function.
       "loop1Task", // name of task.
@@ -206,18 +197,149 @@ void setup()
       0);          // pin task to core 0
 }
 
+float tempC = 0.0f;
+
+// ============================================================================
+// CORE 0 TASK - Secondary loop for dual-core operation
+// ============================================================================
+
 void loop1(void *pvParameters)
 {
   for (;;)
   {
+    if (!conversionRequested && (millis() - lastRequestTime >= readInterval))
+    {
+      temp117.setOneShotMode();
+      conversionRequested = true;
+    }
+
+    if (conversionRequested && temp117.dataReady())
+    {
+      tempC = temp117.readTempC();
+      Serial.print("Temperature: ");
+      Serial.print(tempC);
+      Serial.println(" C");
+
+      conversionRequested = false;
+      lastRequestTime = millis();
+    }
+
+    static byte targetBrightness = 0;
+    static float lux = 0;
+    static byte currentBrightness = 50;
+    static bool isDark = true;
+    if (millis() - lastLightRead > lightInterval)
+    {
+      lastLightRead = millis();
+
+      lightMeter.configure(BH1750::ONE_TIME_HIGH_RES_MODE_2);
+
+      // Block until measurement ready (with timeout for safety)
+      unsigned long start = millis();
+      while (!lightMeter.measurementReady(true))
+      {
+        if (millis() - start > 3000)
+        { // 3s timeout
+          Serial.println("[ERROR] Light sensor timeout!");
+          break;
+        }
+        yield();
+      }
+
+      // Read lux (may be stale if timeout triggered)
+      lux = lightMeter.readLightLevel();
+
+      // Map lux to target brightness
+      byte val1 = constrain(lux, 1, 120);            // Limit lux to 1-120 for mapping
+      targetBrightness = map(val1, 1, 120, 10, 100); // Map to 40-50 range (max brightness = 50)
+
+      Serial.print("[DEBUG] Lux = ");
+      Serial.print(lux);
+      Serial.print(", targetBrightness = ");
+      Serial.print(targetBrightness);
+      Serial.print(", isDark = ");
+      Serial.println(isDark);
+    }
+
+    // --- Brightness animation every 200ms ---
+    if (millis() - lastBrightnessUpdate > brightnessInterval)
+    {
+      lastBrightnessUpdate = millis();
+
+      byte previousBrightness = currentBrightness; // store old value
+      // Update darkness flag
+      isDark = lux <= 1;
+
+      if (isDark)
+      {
+        currentBrightness = 4; // force off
+      }
+      else
+      {
+        // exponential moving average (EMA)
+        float alpha = 0.7; // smoother 0.7-0.9
+        float tempBrightness = currentBrightness;
+        tempBrightness = tempBrightness * alpha + targetBrightness * (1.0 - alpha);
+        currentBrightness = (byte)tempBrightness;
+      }
+
+      // Only write PWM if it changed
+      if (currentBrightness != previousBrightness)
+      {
+        display.setBrightness(currentBrightness);
+        Serial.print("[DEBUG] Brightness = ");
+        Serial.println(currentBrightness);
+      }
+    }
+
+    if (millis() - lastCurrentTime >= currentInterval)
+    {
+      if (ina.conversionReady())
+      {
+        float vBus_V = ina.readBusVoltage();
+        float vShunt_mV = ina.readShuntVoltage();
+        float current_mA = ina.readCurrent();
+        float power_mW = ina.readPower();
+        bool ovf = ina.overflow();
+
+        Serial.print(F("Bus: "));
+        Serial.print(vBus_V, 3);
+        Serial.print(F(" V"));
+        // Serial.print(vShunt_mV, 3);
+        Serial.print(F(" mV  Curr: "));
+        Serial.print(current_mA, 2);
+        Serial.print(F(" mA  Power: "));
+        Serial.print(power_mW, 1);
+        Serial.print(F(" mW"));
+
+        if (ovf)
+          Serial.print(F("  [OVF]"));
+        Serial.println();
+      }
+      lastCurrentTime = millis();
+    }
+
+    if (digitalRead(switch1Pin) == HIGH)
+    {
+      Serial.println("Switch1 pressed");
+    }
+
+    if (digitalRead(switch2Pin) == HIGH)
+    {
+      Serial.println("Switch2 pressed");
+    }
     delay(50);
   }
 }
 
+// ============================================================================
+// MAIN LOOP - Display update and time rendering
+// ============================================================================
+
 bool x = true;
 void loop()
 {
-  // Blinking effect every 500ms
+  // ---- Display Blinking Colon Effect ----
   static unsigned long lastBlinkTime = 0;
   static boolean blinkState = false;
   unsigned long currentTime = millis();
@@ -230,7 +352,6 @@ void loop()
 
   if (blinkState)
   {
-
     display.fillRect(22, 26, 2, 2, myWHITE);
     display.fillRect(22, 35, 2, 2, myWHITE);
   }
@@ -240,7 +361,7 @@ void loop()
     display.fillRect(22, 35, 2, 2, myBLACK);
   }
 
-  // Show content
+  // ---- Read and Format Time Data ----
   DateTime now = rtc.now();
   byte tempHour = now.twelveHour(); // Get the hour in 12-hour format
 
@@ -248,16 +369,19 @@ void loop()
 
   String dateString = padNum(now.day()) + "/" + padNum(now.month()) + "/" + String(now.year()); // Format date string
 
+  // ---- Update Display Every Second ----
   if (x || now.second() == 0)
   {
     x = false;
     display.clearDisplay();
 
+    // Display date
     display.setFont(NULL);
     display.setTextColor(myGREEN);
     display.setCursor(3, 7);
     display.print(dateString);
 
+    // Display time
     display.setFont(&FreeSans9pt7b);
     display.setTextSize(1);
     display.setTextColor(myWHITE);
@@ -269,26 +393,34 @@ void loop()
     display.setFont(NULL);
     display.print(now.isPM() ? " PM" : " AM");
 
+    // Display day and temperature
     display.setTextColor(myYELLOW);
     display.setCursor(3, 50);
     display.print(daysOfTheWeek[now.dayOfTheWeek()]);
     display.setCursor(30, 50);
-    display.print("20.3C");
+    display.print(tempC, 1); // Display temperature with 1 decimal place
+    display.print("C");
   }
 
   delay(100);
 }
 
+// ============================================================================
+// TIME SYNCHRONIZATION - NTP and RTC management
+// ============================================================================
+
 bool rtcTimeUpdater()
 {
   String debugLog = "";
 
+  // ---- Validate RTC Availability ----
   if (!rtc.begin())
   {
     Serial.println("[ERROR] RTC not found - cannot update time");
     return false;
   }
 
+  // ---- Validate WiFi Connection ----
   // Early WiFi validation - check connection status first (WL_CONNECTED = 3)
   int wifiStatus = WiFi.status();
   if (wifiStatus != WL_CONNECTED)
@@ -300,12 +432,14 @@ bool rtcTimeUpdater()
     return false;
   }
 
+  // ---- Configure NTP Server ----
   // Set default NTP server if empty
   if (ntpServer.length() == 0)
   {
     ntpServer = "pool.ntp.org";
   }
 
+  // ---- Attempt NTP Synchronization with Fallback Servers ----
   // Array of fallback NTP servers to try
   const char *ntpServers[] = {"pool.ntp.org", "time.nist.gov", "time.cloudflare.com"};
   int numServers = 3;
@@ -353,6 +487,7 @@ bool rtcTimeUpdater()
     }
   }
 
+  // ---- Handle Synchronization Failure ----
   if (!updated)
   {
     char finalError[180];
@@ -362,6 +497,7 @@ bool rtcTimeUpdater()
     return false;
   }
 
+  // ---- Validate Time From NTP ----
   // Check if time is actually set
   if (!timeClient.isTimeSet())
   {
@@ -379,7 +515,7 @@ bool rtcTimeUpdater()
     return false;
   }
 
-  // Update RTC with validated time
+  // ---- Update RTC with Synchronized Time ----
   DateTime dt(rawtime);
   rtc.adjust(dt);
 
