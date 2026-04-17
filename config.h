@@ -15,14 +15,13 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSerif9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
-#include <WiFi.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
+
 #include <time.h>
 #include "RTClib.h"
 #include <SparkFun_TMP117.h> // TMP117 temperature sensor library
 #include <7Semi_INA219.h>
 #include <BH1750.h>
+#include <TinyGPSPlus.h>
 
 // ============================================================================
 // DISPLAY PIN CONFIGURATION
@@ -66,8 +65,19 @@ uint16_t myCYAN = display.color565(0, 255, 255);
 uint16_t myMAGENTA = display.color565(255, 0, 255);
 uint16_t myBLACK = display.color565(0, 0, 0);
 
+// Additional colors for variety
+uint16_t myORANGE = display.color565(255, 165, 0);      // Orange
+uint16_t myLIME = display.color565(0, 255, 0);          // Lime Green (bright green)
+uint16_t myPURPLE = display.color565(128, 0, 128);      // Purple
+uint16_t myPINK = display.color565(255, 105, 180);      // Hot Pink
+uint16_t myTURQUOISE = display.color565(64, 224, 208);  // Turquoise
+uint16_t myGOLD = display.color565(255, 215, 0);        // Gold
+uint16_t mySALMON = display.color565(250, 128, 114);    // Salmon
+uint16_t myLIGHTBLUE = display.color565(173, 216, 230); // Light Blue
+
 // Color palette array for easy access
-uint16_t myCOLORS[8] = {myRED, myGREEN, myBLUE, myWHITE, myYELLOW, myCYAN, myMAGENTA, myBLACK};
+uint16_t myCOLORS[16] = {myRED, myGREEN, myBLUE, myWHITE, myYELLOW, myCYAN, myMAGENTA, myBLACK,
+                         myORANGE, myLIME, myPURPLE, myPINK, myTURQUOISE, myGOLD, mySALMON, myLIGHTBLUE};
 
 // ============================================================================
 // DISPLAY UPDATE INTERRUPT HANDLER
@@ -114,13 +124,6 @@ RTC_DS1307 rtc;
 char daysOfTheWeek[7][12] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
 
 // ============================================================================
-// NTP CLIENT FOR TIME SYNCHRONIZATION
-// ============================================================================
-
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-
-// ============================================================================
 // GLOBAL TIME AND TASK VARIABLES
 // ============================================================================
 
@@ -132,15 +135,12 @@ String timeStamp;
 // Task handle for core 0 (dual-core CPU management)
 TaskHandle_t loop1Task;
 
-// NTP server configuration
-String ntpServer = "";
-
 // ============================================================================
 // APPLICATION STATE
 // ============================================================================
 
 // Software version for beta builds
-#define SW_VERSION "1.0.0-beta"
+#define SW_VERSION "1.1.0-beta"
 
 // Flags and counters that track application state across the sketch
 bool timeNeedsUpdate = false;
@@ -174,11 +174,11 @@ const int switch1Pin = 25;
 const int switch2Pin = 26;
 
 unsigned long lastRequestTime = 0;
-const unsigned long readInterval = 30000;
+const unsigned long readInterval = 60000;
 bool conversionRequested = false;
 
 unsigned long lastCurrentTime = 0;
-const unsigned long currentInterval = 500;
+const unsigned long currentInterval = 5000;
 
 // LUX (BH1750) update frequency
 unsigned long lastLightRead = 0;
@@ -186,5 +186,12 @@ unsigned long lastBrightnessUpdate = 0;
 
 const unsigned long lightInterval = 4000;    // lux sampling
 const unsigned long brightnessInterval = 50; // animation
+
+// GPS related
+static const int RXPin = 34, TXPin = 4; // GPS UART pins
+TinyGPSPlus gps;
+
+// Time related
+time_t currentEpoch;
 
 #endif // CONFIG_H

@@ -48,7 +48,8 @@
 // the power sensor, and the light sensor.
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
+  Serial1.begin(9600, SERIAL_8N1, RXPin, TXPin);
   Wire.begin(32, 27);
 
   pinMode(buzzerPin, OUTPUT);
@@ -59,13 +60,14 @@ void setup()
   delay(200);
   digitalWrite(buzzerPin, LOW);
 
-  WiFi.mode(WIFI_STA);
+  /*WiFi.mode(WIFI_STA);
   WiFi.begin("SonyBraviaX400", "66227617975PsA#");
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
     delay(200);
-  }
+  }*/
+
   // ---- Initialize Display ----
   // Define your display layout here, e.g. 1/8 step, and optional SPI pins begin(row_pattern, CLK, MOSI, MISO, SS)
   display.begin(32);
@@ -175,6 +177,15 @@ void setup()
 }
 
 float tempC = 0.0f;
+bool hourlyAlarmTriggered = false;
+byte lastAlarmHour = 255; // Track previous hour to detect change
+bool hourlyRtcUpdateTriggered = false;
+byte lastHour = 255; // Track previous hour to detect change
+bool isDark = true;
+
+// Animation for RTC update progress display
+static unsigned long lastAnimationTime = 0;
+static byte animationFrame = 0; // 0-3 for ".", "..", "...", ""
 
 // ============================================================================
 // ============================================================================
@@ -187,6 +198,29 @@ void loop1(void *pvParameters)
 {
   for (;;)
   {
+    // ---- Handle hourly alarm buzzer ----
+    if (hourlyAlarmTriggered && !isDark) // Only buzz if it's not dark (to avoid disturbing sleep)
+    {
+      digitalWrite(buzzerPin, HIGH); // Buzzer on
+      delay(1000);                   // 1 second buzz
+      digitalWrite(buzzerPin, LOW);  // Buzzer off
+      hourlyAlarmTriggered = false;  // Reset flag
+    }
+
+    // ---- Handle hourly RTC update ----
+    if (hourlyRtcUpdateTriggered)
+    {
+      if (rtcTimeUpdater())
+      {
+        Serial.println("[INFO] Hourly RTC update successful");
+      }
+      else
+      {
+        Serial.println("[ERROR] Hourly RTC update failed");
+      }
+      hourlyRtcUpdateTriggered = false; // Reset flag
+    }
+
     if (!conversionRequested && (millis() - lastRequestTime >= readInterval))
     {
       temp117.setOneShotMode();
@@ -207,7 +241,6 @@ void loop1(void *pvParameters)
     static byte targetBrightness = 0;
     static float lux = 0;
     static byte currentBrightness = 50;
-    static bool isDark = true;
     if (millis() - lastLightRead > lightInterval)
     {
       lastLightRead = millis();
@@ -216,6 +249,7 @@ void loop1(void *pvParameters)
 
       // Block until measurement ready (with timeout for safety)
       unsigned long start = millis();
+      bool measurementSuccess = false;
       while (!lightMeter.measurementReady(true))
       {
         if (millis() - start > 3000)
@@ -226,12 +260,19 @@ void loop1(void *pvParameters)
         yield();
       }
 
-      // Read lux (may be stale if timeout triggered)
-      lux = lightMeter.readLightLevel();
+      // Only update lux if measurement succeeded
+      if (millis() - start <= 3000)
+      {
+        lux = lightMeter.readLightLevel();
+        measurementSuccess = true;
+      }
 
       // Map lux to target brightness. 10 is dim, 50 is the brightest value we allow.
-      byte val1 = constrain(lux, 1, 120);           // Keep lux in the expected range
-      targetBrightness = map(val1, 1, 120, 10, 50); // Map full light range to 10-50 brightness
+      if (measurementSuccess)
+      {
+        byte val1 = constrain(lux, 1, 120);           // Keep lux in the expected range
+        targetBrightness = map(val1, 1, 120, 10, 50); // Map full light range to 10-50 brightness
+      }
 
       Serial.print("[DEBUG] Lux = ");
       Serial.print(lux);
@@ -283,7 +324,7 @@ void loop1(void *pvParameters)
         bool ovf = ina.overflow();
 
         // Check for voltage errors
-        if (vBus_V < 4.7 || vBus_V > 5.5 || ovf)
+        if (vBus_V < 4.7 || vBus_V > 5.2 || ovf)
         {
           errorFlag = "VOLT " + String(vBus_V, 2);
         }
@@ -312,7 +353,8 @@ void loop1(void *pvParameters)
     if (digitalRead(switch1Pin) == HIGH)
     {
       Serial.println("Switch1 pressed");
-      delay(200); // simple debounce
+      delay(200);                      // simple debounce
+      hourlyRtcUpdateTriggered = true; // Trigger an immediate RTC update on the next loop
     }
 
     if (digitalRead(switch2Pin) == HIGH)
@@ -330,10 +372,10 @@ void loop1(void *pvParameters)
     if (timeNeedsUpdate || daysPassed >= 5)
     {
       timeNeedsUpdate = true; // Set this early to prevent multiple attempts in the same loop
-      Serial.println("[INFO] Time update needed - attempting NTP sync");
+      Serial.println("[INFO] Time update needed - attempting GPS sync");
       if (rtcTimeUpdater())
       {
-        Serial.println("[INFO] Time updated successfully from NTP");
+        Serial.println("[INFO] Time updated successfully from GPS");
         timeNeedsUpdate = false;
       }
       else
@@ -383,8 +425,22 @@ void loop()
     DateTime now = rtc.now();
     byte tempHour = now.twelveHour(); // Get the hour in 12-hour format
 
-    // byte temp = int(rtc.getTemperature()); // Get the temperature in Celsius, rounded to the nearest integer
     currentDay = now.day();
+
+    // ---- Trigger hourly alarm when hour changes ----
+    if (now.hour() != lastAlarmHour && now.second() == 0)
+    {
+      hourlyAlarmTriggered = true;
+      lastAlarmHour = now.hour();
+    }
+
+    // ---- Trigger hourly RTC update when hour changes ----
+    if (now.hour() != lastHour)
+    {
+      hourlyRtcUpdateTriggered = true;
+      lastHour = now.hour();
+      Serial.println("[INFO] Hourly RTC update triggered");
+    }
 
     String dateString = padNum(currentDay) + "/" + padNum(now.month()) + "/" + String(now.year()); // Format date string
 
@@ -396,7 +452,7 @@ void loop()
 
       // Display date
       display.setFont(NULL);
-      display.setTextColor(myGREEN);
+      display.setTextColor(myCYAN);
       display.setCursor(3, 7);
       display.print(dateString);
 
@@ -422,9 +478,22 @@ void loop()
       }
       else
       {
-        display.setTextColor(myYELLOW);
+        display.setTextColor(myMAGENTA);
         display.setCursor(3, 50);
         display.print(daysOfTheWeek[now.dayOfTheWeek()]);
+
+        // Select temperature color based on value
+        uint16_t tempColor = myYELLOW; // default 29-31°C
+        if (tempC >= 32)
+        {
+          tempColor = myRED; // Red for 32°C and above
+        }
+        else if (tempC <= 29)
+        {
+          tempColor = myBLUE; // Blue for 29°C and below
+        }
+
+        display.setTextColor(tempColor);
         display.setCursor(30, 50);
         display.print(tempC, 1); // Display temperature with 1 decimal place
         display.setCursor(52, 45);
@@ -444,113 +513,89 @@ void loop()
     display.setCursor(0, 10);
     display.print("IN");
     display.setCursor(0, 20);
-    display.print("PROGRESS...");
+    display.print("PROGRESS");
+
+    // Animated ellipsis
+    if (millis() - lastAnimationTime > 300)
+    {
+      lastAnimationTime = millis();
+      animationFrame = (animationFrame + 1) % 4;
+    }
+
+    display.setCursor(0, 30);
+    switch (animationFrame)
+    {
+    case 0:
+      display.print(".");
+      break;
+    case 1:
+      display.print("..");
+      break;
+    case 2:
+      display.print("...");
+      break;
+    case 3:
+      display.print("");
+      break; // blank for cycling effect
+    }
   }
   delay(100);
 }
 
 // ============================================================================
-// TIME SYNCHRONIZATION - NTP and RTC management
+// TIME SYNCHRONIZATION - GPS and RTC management
 // ============================================================================
 
 bool rtcTimeUpdater()
 {
-  String debugLog = "";
-
-  // ---- Validate RTC Availability ----
-  if (!rtc.begin())
+  bool gotFreshGpsData = false;
+  while (Serial1.available())
   {
-    Serial.println("[ERROR] RTC not found - cannot update time");
-    return false;
-  }
+    if (gps.encode(Serial1.read()))
+    { // process gps messages
+      // when TinyGPSPlus reports new data...
+      unsigned long age = gps.time.age();
 
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    char buffer[100];
-    sprintf(buffer, "[WIFI_ERROR] WiFi not connected. Status: %d (need 3). IP: %s", WiFi.status(), WiFi.localIP().toString().c_str());
-    Serial.println(buffer);
-    return false;
-  }
-
-  // ---- Configure NTP Server ----
-  // Set default NTP server if empty
-  if (ntpServer.length() == 0)
-  {
-    ntpServer = "pool.ntp.org";
-  }
-
-  // ---- Attempt NTP Synchronization with Fallback Servers ----
-  // Array of fallback NTP servers to try
-  const char *ntpServers[] = {"pool.ntp.org", "time.nist.gov", "time.cloudflare.com"};
-  int numServers = 3;
-  bool updated = false;
-  String lastError = "";
-
-  for (int attempt = 0; attempt < numServers && !updated; attempt++)
-  {
-    String currentServer = (attempt == 0) ? ntpServer : String(ntpServers[attempt]);
-    char attemptLog[150];
-    sprintf(attemptLog, "[NTP_ATTEMPT_%d] Trying server: %s | TZ offset: %d sec", attempt + 1, currentServer.c_str(), 19800);
-    debugLog += attemptLog;
-    debugLog += " | ";
-    Serial.println(attemptLog);
-
-    // Recreate NTPClient with current server (CRITICAL for each attempt)
-    timeClient = NTPClient(ntpUDP, currentServer.c_str(), 19800);
-    timeClient.begin();
-    delay(300); // Extended delay for UDP + DNS
-
-    // Attempt NTP update with retries
-    for (int retry = 0; retry < 3 && !updated; retry++)
-    {
-      if (retry > 0)
+      if (age < 300)
       {
-        delay(800);
-      }
+        gotFreshGpsData = true;
+        // Build tm struct with GPS UTC
+        struct tm tmUTC = {};
+        int gpsYear = gps.date.year();
+        tmUTC.tm_year = gpsYear - 1900;      // struct tm wants "years since 1900"
+        tmUTC.tm_mon = gps.date.month() - 1; // months 0-11
+        tmUTC.tm_mday = gps.date.day();
+        tmUTC.tm_hour = gps.time.hour();
+        tmUTC.tm_min = gps.time.minute();
+        tmUTC.tm_sec = gps.time.second();
 
-      updated = timeClient.update();
+        if (gpsYear < 2026)
+          return false; // Reject GPS data if the year is before 2026, likely indicating a GPS read error
 
-      char retryLog[120];
-      if (updated)
-      {
-        sprintf(retryLog, "[SUCCESS] Update returned true on %s (retry %d)", currentServer.c_str(), retry);
-        Serial.println(retryLog);
-        debugLog += retryLog;
-        break;
-      }
-      else
-      {
-        sprintf(retryLog, "[RETRY_%d_FAIL] %s returned false", retry + 1, currentServer.c_str());
-        Serial.println(retryLog);
-        lastError = retryLog;
+        // Convert to epoch (UTC)
+        time_t t = mktime(&tmUTC);
+
+        // Apply IST offset (+5:30 → 19800 seconds)
+        t += 19800;
+
+        // Save epoch and also convert to broken-down local time
+        currentEpoch = t;
       }
     }
   }
 
-  // ---- Handle Synchronization Failure ----
-  if (!updated)
+  // If no fresh GPS data was received, skip the update
+  if (!gotFreshGpsData)
   {
-    char finalError[180];
-    sprintf(finalError, "[NTP_FAILED] All %d servers failed. WiFi status: %d. Last attempt: %s",
-            numServers, WiFi.status(), lastError.c_str());
-    Serial.println(finalError);
+    Serial.println("[ERROR] No fresh GPS data (age too old). Skipping RTC update.");
     return false;
   }
 
-  // ---- Validate Time From NTP ----
-  // Check if time is actually set
-  if (!timeClient.isTimeSet())
-  {
-    Serial.println("[TIME_NOT_SET] NTP sync returned success but time not set in client.");
-    return false;
-  }
-
-  // Validate epoch time
-  time_t rawtime = timeClient.getEpochTime();
+  time_t rawtime = currentEpoch;
   if (rawtime < 1000000000UL)
   {
     char epochError[130];
-    sprintf(epochError, "[EPOCH_ERROR] Invalid NTP epoch: %ld (min: 1000000000). Year check failed.", rawtime);
+    sprintf(epochError, "[EPOCH_ERROR] Invalid GPS epoch: %ld (min: 1000000000). Year check failed.", rawtime);
     Serial.println(epochError);
     return false;
   }
@@ -564,4 +609,14 @@ bool rtcTimeUpdater()
           dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
   Serial.println(successMsg);
   return true;
+}
+
+static void smartDelay(unsigned long ms)
+{
+  unsigned long start = millis();
+  do
+  {
+    while (Serial1.available())
+      gps.encode(Serial1.read());
+  } while (millis() - start < ms);
 }
