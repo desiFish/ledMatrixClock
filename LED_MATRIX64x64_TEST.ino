@@ -49,7 +49,6 @@
 void setup()
 {
   Serial.begin(115200);
-  Serial1.begin(9600, SERIAL_8N1, RXPin, TXPin);
   Wire.begin(32, 27);
 
   pinMode(buzzerPin, OUTPUT);
@@ -60,13 +59,13 @@ void setup()
   delay(200);
   digitalWrite(buzzerPin, LOW);
 
-  /*WiFi.mode(WIFI_STA);
-  WiFi.begin("SonyBraviaX400", "66227617975PsA#");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
     delay(200);
-  }*/
+  }
 
   // ---- Initialize Display ----
   // Define your display layout here, e.g. 1/8 step, and optional SPI pins begin(row_pattern, CLK, MOSI, MISO, SS)
@@ -95,7 +94,7 @@ void setup()
   for (int i = 0; i < 3; i++)
   {
     display.fillRect(0, 0, 64, 64, myCOLORS[i]);
-    delay(500);
+    delay(1000);
   }
 
   // ---- Initialize RTC and Synchronize Time ----
@@ -176,12 +175,11 @@ void setup()
       0);          // pin task to core 0
 }
 
-float tempC = 0.0f;
+float tempC = -99.0f;
 bool hourlyAlarmTriggered = false;
 byte lastAlarmHour = 255; // Track previous hour to detect change
-bool hourlyRtcUpdateTriggered = false;
-byte lastHour = 255; // Track previous hour to detect change
 bool isDark = true;
+int wifiRssi = -127; // Stored WiFi RSSI for signal meter display
 
 // Animation for RTC update progress display
 static unsigned long lastAnimationTime = 0;
@@ -207,18 +205,14 @@ void loop1(void *pvParameters)
       hourlyAlarmTriggered = false;  // Reset flag
     }
 
-    // ---- Handle hourly RTC update ----
-    if (hourlyRtcUpdateTriggered)
+    // ---- Update stored WiFi RSSI ----
+    if (WiFi.status() == WL_CONNECTED)
     {
-      if (rtcTimeUpdater())
-      {
-        Serial.println("[INFO] Hourly RTC update successful");
-      }
-      else
-      {
-        Serial.println("[ERROR] Hourly RTC update failed");
-      }
-      hourlyRtcUpdateTriggered = false; // Reset flag
+      wifiRssi = WiFi.RSSI();
+    }
+    else
+    {
+      wifiRssi = -127;
     }
 
     if (!conversionRequested && (millis() - lastRequestTime >= readInterval))
@@ -324,7 +318,7 @@ void loop1(void *pvParameters)
         bool ovf = ina.overflow();
 
         // Check for voltage errors
-        if (vBus_V < 4.7 || vBus_V > 5.2 || ovf)
+        if (vBus_V < 4.7 || vBus_V > 5.3 || ovf)
         {
           errorFlag = "VOLT " + String(vBus_V, 2);
         }
@@ -353,8 +347,8 @@ void loop1(void *pvParameters)
     if (digitalRead(switch1Pin) == HIGH)
     {
       Serial.println("Switch1 pressed");
-      delay(200);                      // simple debounce
-      hourlyRtcUpdateTriggered = true; // Trigger an immediate RTC update on the next loop
+      delay(200);             // simple debounce
+      timeNeedsUpdate = true; // Trigger an immediate RTC update on the next loop
     }
 
     if (digitalRead(switch2Pin) == HIGH)
@@ -372,10 +366,10 @@ void loop1(void *pvParameters)
     if (timeNeedsUpdate || daysPassed >= 5)
     {
       timeNeedsUpdate = true; // Set this early to prevent multiple attempts in the same loop
-      Serial.println("[INFO] Time update needed - attempting GPS sync");
+      Serial.println("[INFO] Time update needed - attempting NTP sync");
       if (rtcTimeUpdater())
       {
-        Serial.println("[INFO] Time updated successfully from GPS");
+        Serial.println("[INFO] Time updated successfully from NTP");
         timeNeedsUpdate = false;
       }
       else
@@ -434,14 +428,6 @@ void loop()
       lastAlarmHour = now.hour();
     }
 
-    // ---- Trigger hourly RTC update when hour changes ----
-    if (now.hour() != lastHour)
-    {
-      hourlyRtcUpdateTriggered = true;
-      lastHour = now.hour();
-      Serial.println("[INFO] Hourly RTC update triggered");
-    }
-
     String dateString = padNum(currentDay) + "/" + padNum(now.month()) + "/" + String(now.year()); // Format date string
 
     // ---- Update Display Every Second ----
@@ -449,6 +435,49 @@ void loop()
     {
       x = false;
       display.clearDisplay();
+
+      // Display WiFi signal as a single row of dots above the date
+      uint16_t wifiColor = myRED;
+      byte signalDots = 0;
+      if (wifiRssi >= -60)
+      {
+        wifiColor = myGREEN;
+        signalDots = 5;
+      }
+      else if (wifiRssi >= -70)
+      {
+        wifiColor = myGREEN;
+        signalDots = 4;
+      }
+      else if (wifiRssi >= -80)
+      {
+        wifiColor = myORANGE;
+        signalDots = 3;
+      }
+      else if (wifiRssi >= -90)
+      {
+        wifiColor = myORANGE;
+        signalDots = 2;
+      }
+      else if (wifiRssi > -127)
+      {
+        wifiColor = myRED;
+        signalDots = 1;
+      }
+      else
+      {
+        signalDots = 0;
+      }
+
+      display.fillRect(50, 0, 24, 8, myBLACK);
+      const byte dotSize = 2;
+      const byte dotSpacing = 1;
+      for (byte dotIndex = 0; dotIndex < 5; dotIndex++)
+      {
+        byte x = 50 + dotIndex * (dotSize + dotSpacing);
+        byte y = 0;
+        display.fillRect(x, y, dotSize, dotSize, (dotIndex < signalDots) ? wifiColor : myBLACK);
+      }
 
       // Display date
       display.setFont(NULL);
@@ -482,24 +511,33 @@ void loop()
         display.setCursor(3, 50);
         display.print(daysOfTheWeek[now.dayOfTheWeek()]);
 
-        // Select temperature color based on value
-        uint16_t tempColor = myYELLOW; // default 29-31°C
-        if (tempC >= 32)
+        if (tempC == -99.0f)
         {
-          tempColor = myRED; // Red for 32°C and above
+          display.setCursor(30, 50);
+          display.setTextColor(myRED);
+          display.print("WAIT");
         }
-        else if (tempC <= 29)
+        else
         {
-          tempColor = myBLUE; // Blue for 29°C and below
-        }
+          // Select temperature color based on value
+          uint16_t tempColor = myYELLOW; // default 29-31°C
+          if (tempC >= 32)
+          {
+            tempColor = myRED; // Red for 32°C and above
+          }
+          else if (tempC <= 29)
+          {
+            tempColor = myBLUE; // Blue for 29°C and below
+          }
 
-        display.setTextColor(tempColor);
-        display.setCursor(30, 50);
-        display.print(tempC, 1); // Display temperature with 1 decimal place
-        display.setCursor(52, 45);
-        display.print(".");
-        display.setCursor(57, 50);
-        display.print("C");
+          display.setTextColor(tempColor);
+          display.setCursor(30, 50);
+          display.print(tempC, 1); // Display temperature with 1 decimal place
+          display.setCursor(52, 45);
+          display.print(".");
+          display.setCursor(57, 50);
+          display.print("C");
+        }
       }
     }
   }
@@ -543,80 +581,112 @@ void loop()
 }
 
 // ============================================================================
-// TIME SYNCHRONIZATION - GPS and RTC management
+// TIME SYNCHRONIZATION - NTP and RTC management
 // ============================================================================
 
 bool rtcTimeUpdater()
 {
-  bool gotFreshGpsData = false;
-  while (Serial1.available())
+  if (!rtc.begin())
   {
-    if (gps.encode(Serial1.read()))
-    { // process gps messages
-      // when TinyGPSPlus reports new data...
-      unsigned long age = gps.time.age();
+    Serial.println("[ERROR] RTC not found - cannot update time");
+    return false;
+  }
 
-      if (age < 300)
+  // Early WiFi validation - check connection status first (WL_CONNECTED = 3)
+  int wifiStatus = WiFi.status();
+  if (wifiStatus != WL_CONNECTED)
+  {
+    char buffer[100];
+    sprintf(buffer, "[WIFI_ERROR] WiFi not connected. Status: %d (need 3). IP: %s", wifiStatus, WiFi.localIP().toString().c_str());
+    Serial.println(buffer);
+    return false;
+  }
+
+  String ntpServer = "pool.ntp.org";
+
+  // Array of fallback NTP servers to try
+  const char *ntpServers[] = {"pool.ntp.org", "time.nist.gov", "time.cloudflare.com"};
+  int numServers = 3;
+  bool updated = false;
+  String lastError = "";
+
+  for (int attempt = 0; attempt < numServers && !updated; attempt++)
+  {
+    String currentServer = (attempt == 0) ? ntpServer : String(ntpServers[attempt]);
+    char attemptLog[150];
+    sprintf(attemptLog, "[NTP_ATTEMPT_%d] Trying server: %s | TZ offset: %d sec", attempt + 1, currentServer.c_str(), 19800);
+    Serial.println(attemptLog);
+
+    // Recreate NTPClient with current server (CRITICAL for each attempt)
+    timeClient = NTPClient(ntpUDP, currentServer.c_str(), 19800);
+    timeClient.begin();
+    delay(300); // Extended delay for UDP + DNS
+
+    // Attempt NTP update with retries
+    for (int retry = 0; retry < 3 && !updated; retry++)
+    {
+      if (retry > 0)
       {
-        gotFreshGpsData = true;
-        // Build tm struct with GPS UTC
-        struct tm tmUTC = {};
-        int gpsYear = gps.date.year();
-        tmUTC.tm_year = gpsYear - 1900;      // struct tm wants "years since 1900"
-        tmUTC.tm_mon = gps.date.month() - 1; // months 0-11
-        tmUTC.tm_mday = gps.date.day();
-        tmUTC.tm_hour = gps.time.hour();
-        tmUTC.tm_min = gps.time.minute();
-        tmUTC.tm_sec = gps.time.second();
+        delay(800);
+      }
 
-        if (gpsYear < 2026)
-          return false; // Reject GPS data if the year is before 2026, likely indicating a GPS read error
+      updated = timeClient.update();
 
-        // Convert to epoch (UTC)
-        time_t t = mktime(&tmUTC);
-
-        // Apply IST offset (+5:30 → 19800 seconds)
-        t += 19800;
-
-        // Save epoch and also convert to broken-down local time
-        currentEpoch = t;
+      char retryLog[120];
+      if (updated)
+      {
+        sprintf(retryLog, "[SUCCESS] Update returned true on %s (retry %d)", currentServer.c_str(), retry);
+        Serial.println(retryLog);
+        break;
+      }
+      else
+      {
+        sprintf(retryLog, "[RETRY_%d_FAIL] %s returned false", retry + 1, currentServer.c_str());
+        Serial.println(retryLog);
+        lastError = retryLog;
       }
     }
   }
 
-  // If no fresh GPS data was received, skip the update
-  if (!gotFreshGpsData)
+  if (!updated)
   {
-    Serial.println("[ERROR] No fresh GPS data (age too old). Skipping RTC update.");
+    char finalError[180];
+    sprintf(finalError, "[NTP_FAILED] All %d servers failed. WiFi status: %d. Last attempt: %s",
+            numServers, WiFi.status(), lastError.c_str());
+    Serial.println(finalError);
     return false;
   }
 
-  time_t rawtime = currentEpoch;
+  // Check if time is actually set
+  if (!timeClient.isTimeSet())
+  {
+    Serial.println("[TIME_NOT_SET] NTP sync returned success but time not set in client.");
+    return false;
+  }
+
+  // Validate epoch time
+  time_t rawtime = timeClient.getEpochTime();
   if (rawtime < 1000000000UL)
   {
     char epochError[130];
-    sprintf(epochError, "[EPOCH_ERROR] Invalid GPS epoch: %ld (min: 1000000000). Year check failed.", rawtime);
+    sprintf(epochError, "[EPOCH_ERROR] Invalid NTP epoch: %ld (min: 1000000000). Year check failed.", rawtime);
     Serial.println(epochError);
     return false;
   }
 
-  // ---- Update RTC with Synchronized Time ----
+  // Update RTC with validated time
   DateTime dt(rawtime);
   rtc.adjust(dt);
+
+  if (dt.year() < 2026)
+  {
+    Serial.println("Year check failed after RTC adjust. Retrying...");
+    return false;
+  }
 
   char successMsg[150];
   sprintf(successMsg, "[SUCCESS] RTC synced to: %04d-%02d-%02d %02d:%02d:%02d",
           dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
   Serial.println(successMsg);
   return true;
-}
-
-static void smartDelay(unsigned long ms)
-{
-  unsigned long start = millis();
-  do
-  {
-    while (Serial1.available())
-      gps.encode(Serial1.read());
-  } while (millis() - start < ms);
 }

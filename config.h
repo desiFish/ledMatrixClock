@@ -13,15 +13,17 @@
 
 #include <PxMatrix.h>
 #include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSerif9pt7b.h>
-#include <Fonts/FreeMono9pt7b.h>
 
 #include <time.h>
 #include "RTClib.h"
 #include <SparkFun_TMP117.h> // TMP117 temperature sensor library
 #include <7Semi_INA219.h>
 #include <BH1750.h>
-#include <TinyGPSPlus.h>
+
+#include <WiFi.h>
+
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
 // ============================================================================
 // DISPLAY PIN CONFIGURATION
@@ -187,11 +189,8 @@ unsigned long lastBrightnessUpdate = 0;
 const unsigned long lightInterval = 4000;    // lux sampling
 const unsigned long brightnessInterval = 50; // animation
 
-// GPS related
-static const int RXPin = 34, TXPin = 4; // GPS UART pins
-TinyGPSPlus gps;
-
-// Time related
-time_t currentEpoch;
+// NTP related
+WiFiUDP ntpUDP;                                         // Create a UDP instance to send and receive NTP packets
+NTPClient timeClient(ntpUDP, "in.pool.ntp.org", 19800); // 19800 is offset of India, in.pool.ntp.org is close to India
 
 #endif // CONFIG_H
