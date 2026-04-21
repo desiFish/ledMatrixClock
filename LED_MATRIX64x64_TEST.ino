@@ -31,6 +31,12 @@
 #include "config.h"
 
 // ============================================================================
+// GLOBAL FLAGS
+// ============================================================================
+// Flag to skip jump detection after successful RTC sync to prevent false anomalies
+bool skipNextJumpCheck = false;
+
+// ============================================================================
 // ABOUT THIS PROGRAM
 // ============================================================================
 
@@ -60,7 +66,7 @@ void setup()
   digitalWrite(buzzerPin, LOW);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin();
+  WiFi.begin("SonyBraviaX400", "66227617975PsA#");
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
@@ -173,6 +179,8 @@ void setup()
       1,           // priority of the task
       &loop1Task,  // Task handle to keep track of created task
       0);          // pin task to core 0
+
+  x = true; // Force initial display update on first loop
 }
 
 float tempC = -99.0f;
@@ -181,9 +189,26 @@ byte lastAlarmHour = 255; // Track previous hour to detect change
 bool isDark = true;
 int wifiRssi = -127; // Stored WiFi RSSI for signal meter display
 
+// WiFi signal display tracking
+byte lastSignalDots = 255;                // Track previous signal strength to detect changes
+uint16_t lastWifiColor = myBLACK;         // Track previous signal color
+unsigned long lastWiFiUpdateTime = 0;     // Track last WiFi signal update time
+unsigned long lastWiFiRssiUpdateTime = 0; // Track last WiFi RSSI reading time
+
+// Display section tracking for localized updates
+byte lastDisplayedDay = 255;
+byte lastDisplayedMonth = 255;
+int lastDisplayedYear = -1;
+byte lastDisplayedHour = 255;
+byte lastDisplayedMinute = 255;
+bool lastDisplayedIsPM = false;
+byte lastDisplayedDayOfWeek = 255;
+float lastDisplayedTempC = -99.0f;
+bool lastDisplayedErrorFlag = false;
+
 // Animation for RTC update progress display
-static unsigned long lastAnimationTime = 0;
-static byte animationFrame = 0; // 0-3 for ".", "..", "...", ""
+unsigned long lastAnimationTime = 0;
+byte animationFrame = 0; // 0-3 for ".", "..", "...", ""
 
 // ============================================================================
 // ============================================================================
@@ -205,14 +230,20 @@ void loop1(void *pvParameters)
       hourlyAlarmTriggered = false;  // Reset flag
     }
 
-    // ---- Update stored WiFi RSSI ----
-    if (WiFi.status() == WL_CONNECTED)
+    // ---- Update stored WiFi RSSI every 5 seconds ----
+    if (millis() - lastWiFiRssiUpdateTime >= 5000)
     {
-      wifiRssi = WiFi.RSSI();
-    }
-    else
-    {
-      wifiRssi = -127;
+      lastWiFiRssiUpdateTime = millis();
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        wifiRssi = WiFi.RSSI();
+        Serial.print("[DEBUG] WiFi RSSI: ");
+        Serial.println(wifiRssi);
+      }
+      else
+      {
+        wifiRssi = -127;
+      }
     }
 
     if (!conversionRequested && (millis() - lastRequestTime >= readInterval))
@@ -346,15 +377,16 @@ void loop1(void *pvParameters)
 
     if (digitalRead(switch1Pin) == HIGH)
     {
-      Serial.println("Switch1 pressed");
+      Serial.println("Switch1 pressed - Requesting time update...");
       delay(200);             // simple debounce
       timeNeedsUpdate = true; // Trigger an immediate RTC update on the next loop
     }
 
     if (digitalRead(switch2Pin) == HIGH)
     {
-      Serial.println("Switch2 pressed");
-      delay(200); // simple debounce
+      Serial.println("Switch2 pressed - Resetting...");
+      delay(200);    // simple debounce
+      ESP.restart(); // Restart the microcontroller
     }
 
     // Calculate how many days have passed since the last time sync.
@@ -371,6 +403,7 @@ void loop1(void *pvParameters)
       {
         Serial.println("[INFO] Time updated successfully from NTP");
         timeNeedsUpdate = false;
+        skipNextJumpCheck = true; // Skip jump detection after successful sync
       }
       else
       {
@@ -385,12 +418,210 @@ void loop1(void *pvParameters)
 }
 
 // ============================================================================
+// RTC HELPER FUNCTIONS - Clean modular architecture
+// ============================================================================
+
+// Double-read validation: detects I2C corruption
+DateTime doubleReadRTC()
+{
+  DateTime now1 = rtc.now();
+  delay(5);
+  DateTime now2 = rtc.now();
+
+  // Check if the two reads differ by more than 2 seconds
+  if (abs((long)(now2.unixtime() - now1.unixtime())) > 2)
+  {
+    Serial.println("[RTC_ERROR] Inconsistent I2C read detected");
+    Serial.print("[RTC_DEBUG] Read 1: ");
+    Serial.print(now1.unixtime());
+    Serial.print(" | Read 2: ");
+    Serial.println(now2.unixtime());
+    return DateTime(1); // Return invalid epoch (1970)
+  }
+
+  return now2; // Use second read as it's more likely correct
+}
+
+// Basic range validation for all RTC fields
+bool basicRangeCheck(DateTime now)
+{
+  // Check hour (0-23)
+  if (now.hour() > 23)
+  {
+    Serial.print("[RTC_ERROR] Invalid hour: ");
+    Serial.println(now.hour());
+    return false;
+  }
+
+  // Check minute (0-59)
+  if (now.minute() > 59)
+  {
+    Serial.print("[RTC_ERROR] Invalid minute: ");
+    Serial.println(now.minute());
+    return false;
+  }
+
+  // Check second (0-59)
+  if (now.second() > 59)
+  {
+    Serial.print("[RTC_ERROR] Invalid second: ");
+    Serial.println(now.second());
+    return false;
+  }
+
+  // Check day (1-31)
+  if (now.day() < 1 || now.day() > 31)
+  {
+    Serial.print("[RTC_ERROR] Invalid day: ");
+    Serial.println(now.day());
+    return false;
+  }
+
+  // Check month (1-12)
+  if (now.month() < 1 || now.month() > 12)
+  {
+    Serial.print("[RTC_ERROR] Invalid month: ");
+    Serial.println(now.month());
+    return false;
+  }
+
+  // Check year (2026-2100)
+  if (now.year() < 2026 || now.year() > 2100)
+  {
+    Serial.print("[RTC_ERROR] Invalid year: ");
+    Serial.println(now.year());
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================================
+// RTC SANITY CHECK - Main validation function (clean architecture)
+// ============================================================================
+// Returns true if RTC values are valid, false if corrupted/abnormal
+bool rtcSanityCheck()
+{
+  static long lastUnix = 0;
+  static bool firstCheck = true;
+
+  // Get RTC time with double-read validation
+  DateTime now = doubleReadRTC();
+
+  // Basic range check on all fields
+  if (!basicRangeCheck(now))
+  {
+    return false;
+  }
+
+  // Jump detection (only after first check AND not skipping due to recent sync)
+  if (!firstCheck && !skipNextJumpCheck)
+  {
+    long currentUnix = now.unixtime();
+    long timeDiff = currentUnix - lastUnix;
+
+    // Allow up to 2 minutes (120 seconds) between checks
+    if (timeDiff < 0 || timeDiff > 120)
+    {
+      Serial.print("[RTC_ERROR] Abnormal time jump: ");
+      Serial.print(timeDiff);
+      Serial.println(" sec");
+      return false;
+    }
+  }
+
+  // Clear the skip flag after this check
+  if (skipNextJumpCheck)
+  {
+    skipNextJumpCheck = false;
+  }
+
+  // Update baseline for next check
+  lastUnix = now.unixtime();
+  firstCheck = false;
+
+  return true;
+}
+
+// ============================================================================
+// WiFi SIGNAL DISPLAY - Update WiFi signal indicator only when signal changes
+// ============================================================================
+// Returns true if the signal strength changed and was redrawn
+bool updateWiFiSignalDisplay()
+{
+  // Calculate current signal strength
+  uint16_t wifiColor = myRED;
+  byte signalDots = 0;
+
+  if (wifiRssi >= -60)
+  {
+    wifiColor = myGREEN;
+    signalDots = 5;
+  }
+  else if (wifiRssi >= -70)
+  {
+    wifiColor = myGREEN;
+    signalDots = 4;
+  }
+  else if (wifiRssi >= -80)
+  {
+    wifiColor = myORANGE;
+    signalDots = 3;
+  }
+  else if (wifiRssi >= -90)
+  {
+    wifiColor = myORANGE;
+    signalDots = 2;
+  }
+  else if (wifiRssi > -127)
+  {
+    wifiColor = myRED;
+    signalDots = 1;
+  }
+  else
+  {
+    signalDots = 0;
+  }
+
+  // Check if signal changed
+  if (lastSignalDots == signalDots && lastWifiColor == wifiColor)
+  {
+    return false; // No change, don't redraw
+  }
+
+  // Update tracking variables
+  lastSignalDots = signalDots;
+  lastWifiColor = wifiColor;
+
+  // Redraw WiFi signal indicator
+  display.fillRect(50, 0, 24, 4, myBLACK);
+  const byte dotSize = 2;
+  const byte dotSpacing = 1;
+  for (byte dotIndex = 0; dotIndex < 5; dotIndex++)
+  {
+    byte x = 62 - dotIndex * (dotSize + dotSpacing);
+    byte y = 0;
+    display.fillRect(x, y, dotSize, dotSize, (dotIndex < signalDots) ? wifiColor : myBLACK);
+  }
+
+  return true; // Signal changed and was redrawn
+}
+
+// ============================================================================
 // MAIN LOOP - Display update and time rendering
 // ============================================================================
 // This is the frame loop for the LED matrix. It redraws the clock and
 // updates the blinking colon, while the background task handles sensors and sync.
 void loop()
 {
+  static bool lastTimeNeedsUpdate = false;
+
+  if (timeNeedsUpdate != lastTimeNeedsUpdate)
+  {
+    display.clearDisplay(); // clear ONLY on transition
+    lastTimeNeedsUpdate = timeNeedsUpdate;
+  }
+
   if (!timeNeedsUpdate)
   {
     // ---- Display Blinking Colon Effect ----
@@ -417,133 +648,141 @@ void loop()
 
     // ---- Read and Format Time Data ----
     DateTime now = rtc.now();
+
+    // ---- Sanity Check RTC Values ----
+    if (!rtcSanityCheck())
+    {
+      // RTC corruption detected - attempt recovery
+      Serial.println("[RTC_RECOVERY] Starting recovery sequence...");
+
+      if (rtcTimeUpdater())
+      {
+        Serial.println("[RTC_RECOVERY] Time updated successfully");
+        skipNextJumpCheck = true; // Skip jump detection after successful recovery
+        delay(500);
+        // ESP.restart();
+      }
+      else
+      {
+        Serial.println("[RTC_RECOVERY] Update failed.");
+        delay(1000);
+        errorFlag = "RTC CORRUPT";
+      }
+    }
+
     byte tempHour = now.twelveHour(); // Get the hour in 12-hour format
 
     currentDay = now.day();
 
     // ---- Trigger hourly alarm when hour changes ----
-    if (now.hour() != lastAlarmHour && now.second() == 0)
+    if (now.hour() != lastAlarmHour && now.minute() == 0 && now.second() == 0)
     {
       hourlyAlarmTriggered = true;
       lastAlarmHour = now.hour();
     }
 
-    String dateString = padNum(currentDay) + "/" + padNum(now.month()) + "/" + String(now.year()); // Format date string
+    // Update WiFi signal display every 5 seconds (only redraws if signal changed)
+    if (millis() - lastWiFiUpdateTime >= 5000)
+    {
+      lastWiFiUpdateTime = millis();
+      updateWiFiSignalDisplay();
+    }
 
-    // ---- Update Display Every Second ----
+    char dateString[12];
+    sprintf(dateString, "%02d/%02d/%04d", currentDay, now.month(), now.year());
+
+    // ---- Update Display Every Minute ----
     if (x || now.second() == 0)
     {
       x = false;
-      display.clearDisplay();
+      bool isPM = now.isPM();
+      bool hasError = errorFlag.length() > 0;
 
-      // Display WiFi signal as a single row of dots above the date
-      uint16_t wifiColor = myRED;
-      byte signalDots = 0;
-      if (wifiRssi >= -60)
+      // ---- Update Date Block (day/month/year) ----
+      if (lastDisplayedDay != currentDay || lastDisplayedMonth != now.month() || lastDisplayedYear != now.year())
       {
-        wifiColor = myGREEN;
-        signalDots = 5;
-      }
-      else if (wifiRssi >= -70)
-      {
-        wifiColor = myGREEN;
-        signalDots = 4;
-      }
-      else if (wifiRssi >= -80)
-      {
-        wifiColor = myORANGE;
-        signalDots = 3;
-      }
-      else if (wifiRssi >= -90)
-      {
-        wifiColor = myORANGE;
-        signalDots = 2;
-      }
-      else if (wifiRssi > -127)
-      {
-        wifiColor = myRED;
-        signalDots = 1;
-      }
-      else
-      {
-        signalDots = 0;
+        lastDisplayedDay = currentDay;
+        lastDisplayedMonth = now.month();
+        lastDisplayedYear = now.year();
+        display.fillRect(0, 4, 64, 12, myBLACK);
+        display.setFont(NULL);
+        display.setTextColor(myCYAN);
+        display.setCursor(3, 10);
+        display.print(dateString);
       }
 
-      display.fillRect(50, 0, 24, 8, myBLACK);
-      const byte dotSize = 2;
-      const byte dotSpacing = 1;
-      for (byte dotIndex = 0; dotIndex < 5; dotIndex++)
+      // ---- Update Time Block (hour/minute/AM-PM) ----
+      if (lastDisplayedHour != tempHour || lastDisplayedMinute != now.minute() || lastDisplayedIsPM != isPM)
       {
-        byte x = 50 + dotIndex * (dotSize + dotSpacing);
-        byte y = 0;
-        display.fillRect(x, y, dotSize, dotSize, (dotIndex < signalDots) ? wifiColor : myBLACK);
+        lastDisplayedHour = tempHour;
+        lastDisplayedMinute = now.minute();
+        lastDisplayedIsPM = isPM;
+        display.fillRect(0, 24, 64, 22, myBLACK);
+        display.setFont(&FreeSans9pt7b);
+        display.setTextSize(1);
+        display.setTextColor(myWHITE);
+        display.setCursor(0, 37);
+        display.print(padNum(tempHour));
+        display.setCursor(26, 37);
+        display.print(padNum(now.minute()));
+        display.setFont(NULL);
+        display.print(isPM ? " PM" : " AM");
       }
 
-      // Display date
-      display.setFont(NULL);
-      display.setTextColor(myCYAN);
-      display.setCursor(3, 7);
-      display.print(dateString);
-
-      // Display time
-      display.setFont(&FreeSans9pt7b);
-      display.setTextSize(1);
-      display.setTextColor(myWHITE);
-      display.setCursor(0, 37);
-      display.print(padNum(tempHour));
-
-      display.setCursor(26, 37);
-      display.print(padNum(now.minute()));
-      display.setFont(NULL);
-      display.print(now.isPM() ? " PM" : " AM");
-
-      // If something went wrong while initializing hardware or during
-      // voltage monitoring, show that error instead of the normal footer.
-      if (errorFlag.length() > 0)
+      // ---- Update Day and Temperature Block ----
+      if (lastDisplayedErrorFlag != hasError || lastDisplayedDayOfWeek != now.dayOfTheWeek() ||
+          lastDisplayedTempC != tempC || (tempC != -99.0f && (int)(lastDisplayedTempC * 10) != (int)(tempC * 10)))
       {
-        display.setTextColor(myRED);
-        display.setCursor(3, 50);
-        display.print(errorFlag);
-      }
-      else
-      {
-        display.setTextColor(myMAGENTA);
-        display.setCursor(3, 50);
-        display.print(daysOfTheWeek[now.dayOfTheWeek()]);
+        lastDisplayedErrorFlag = hasError;
+        lastDisplayedDayOfWeek = now.dayOfTheWeek();
+        lastDisplayedTempC = tempC;
+        display.fillRect(0, 48, 64, 19, myBLACK);
 
-        if (tempC == -99.0f)
+        if (hasError)
         {
-          display.setCursor(30, 50);
           display.setTextColor(myRED);
-          display.print("WAIT");
+          display.setCursor(3, 50);
+          display.print(errorFlag);
         }
         else
         {
-          // Select temperature color based on value
-          uint16_t tempColor = myYELLOW; // default 29-31°C
-          if (tempC >= 32)
-          {
-            tempColor = myRED; // Red for 32°C and above
-          }
-          else if (tempC <= 29)
-          {
-            tempColor = myBLUE; // Blue for 29°C and below
-          }
+          display.setTextColor(myMAGENTA);
+          display.setCursor(3, 50);
+          display.print(daysOfTheWeek[now.dayOfTheWeek()]);
 
-          display.setTextColor(tempColor);
-          display.setCursor(30, 50);
-          display.print(tempC, 1); // Display temperature with 1 decimal place
-          display.setCursor(52, 45);
-          display.print(".");
-          display.setCursor(57, 50);
-          display.print("C");
+          if (tempC == -99.0f)
+          {
+            display.setCursor(30, 50);
+            display.setTextColor(myRED);
+            display.print("WAIT");
+          }
+          else
+          {
+            // Select temperature color based on value
+            uint16_t tempColor = myYELLOW; // default 29-31°C
+            if (tempC >= 34)
+            {
+              tempColor = myRED; // Red for 32°C and above
+            }
+            else if (tempC < 29)
+            {
+              tempColor = myBLUE; // Blue for 29°C and below
+            }
+
+            display.setTextColor(tempColor);
+            display.setCursor(30, 50);
+            display.print(tempC, 1); // Display temperature with 1 decimal place
+            display.setCursor(52, 45);
+            display.print(".");
+            display.setCursor(57, 50);
+            display.print("C");
+          }
         }
       }
     }
   }
   else
   {
-    display.clearDisplay();
     display.setFont(NULL);
     display.setTextColor(myRED);
     display.setCursor(0, 0);
@@ -576,8 +815,11 @@ void loop()
       display.print("");
       break; // blank for cycling effect
     }
+    lastDisplayedDay = 255;
+    lastDisplayedMinute = 255;
+    lastDisplayedDayOfWeek = 255;
   }
-  delay(100);
+  delay(20);
 }
 
 // ============================================================================
