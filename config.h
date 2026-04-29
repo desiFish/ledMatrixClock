@@ -15,7 +15,7 @@
 #include <Fonts/FreeSans9pt7b.h>
 
 #include <time.h>
-#include "RTClib.h"
+#include <sys/time.h>
 #include <SparkFun_TMP117.h> // TMP117 temperature sensor library
 #include <7Semi_INA219.h>
 #include <BH1750.h>
@@ -120,7 +120,7 @@ void display_update_enable(bool is_enable)
 // RTC AND TIME MANAGEMENT
 // ============================================================================
 
-RTC_DS1307 rtc;
+// Using ESP32 internal RTC with NTP synchronization
 
 // Day of week names
 char daysOfTheWeek[7][12] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
@@ -149,6 +149,7 @@ bool timeNeedsUpdate = false;
 String errorFlag = "";
 byte currentDay = 0;
 byte lastCheckedDay = 0;
+unsigned long lastBackgroundNtpTime = 0;  // Track last background NTP sync time
 bool x = true; // Used to force display refresh when time sync status changes
 
 // ============================================================================
@@ -162,6 +163,81 @@ bool x = true; // Used to force display refresh when time sync status changes
 String padNum(int num)
 {
     return (num < 10 ? "0" : "") + String(num);
+}
+
+/**
+ * Get current time from ESP32 internal RTC
+ * @return time_t (Unix timestamp)
+ */
+inline time_t getCurrentTime()
+{
+    return time(nullptr);
+}
+
+/**
+ * Get current time broken down into components
+ * @return struct tm with year, month, day, hour, minute, second
+ */
+inline struct tm *getTimeInfo()
+{
+    time_t now = getCurrentTime();
+    return localtime(&now);
+}
+
+/**
+ * Helper to get hour (0-23)
+ */
+inline uint8_t getHour()
+{
+    return getTimeInfo()->tm_hour;
+}
+
+/**
+ * Helper to get minute (0-59)
+ */
+inline uint8_t getMinute()
+{
+    return getTimeInfo()->tm_min;
+}
+
+/**
+ * Helper to get second (0-59)
+ */
+inline uint8_t getSecond()
+{
+    return getTimeInfo()->tm_sec;
+}
+
+/**
+ * Helper to get day of month (1-31)
+ */
+inline uint8_t getDay()
+{
+    return getTimeInfo()->tm_mday;
+}
+
+/**
+ * Helper to get month (1-12)
+ */
+inline uint8_t getMonth()
+{
+    return getTimeInfo()->tm_mon + 1;
+}
+
+/**
+ * Helper to get year (e.g., 2026)
+ */
+inline uint16_t getYear()
+{
+    return getTimeInfo()->tm_year + 1900;
+}
+
+/**
+ * Helper to get day of week (0=Sunday, 6=Saturday)
+ */
+inline uint8_t getDayOfWeek()
+{
+    return getTimeInfo()->tm_wday;
 }
 
 // ============================================================================// SENSOR AND ACTUATOR OBJECTS

@@ -70,6 +70,7 @@ void setup()
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
   {
+    Serial.print(".");
     delay(200);
   }
 
@@ -103,23 +104,22 @@ void setup()
     delay(1000);
   }
 
-  // ---- Initialize RTC and Synchronize Time ----
-  if (!rtc.begin())
+  // ---- Initialize System Time ----
+  // Check if system time is valid (year should not be 1970)
+  uint16_t currentYear = getYear();
+  if (currentYear <= 1970)
   {
-    errorFlag = "RTC ERROR";
-    Serial.println("Couldn't find RTC");
+    Serial.println("[INFO] System time not initialized, marking for NTP update");
+    timeNeedsUpdate = true;
   }
   else
   {
-    // Get current RTC time
-    DateTime now = rtc.now();
-
-    // Check if RTC is not initialized (year = 1970) or RTC is not running
-    if (now.year() == 1970 || !rtc.isrunning())
-    {
-      Serial.println("RTC not initialized or not running, marking for update");
-      timeNeedsUpdate = true;
-    }
+    Serial.print("[INFO] System time initialized to: ");
+    Serial.print(currentYear);
+    Serial.print("-");
+    Serial.print(padNum(getMonth()));
+    Serial.print("-");
+    Serial.println(padNum(getDay()));
   }
 
   if (!temp117.begin()) // Initialize TMP117 and verify the device is present
@@ -265,7 +265,7 @@ void loop1(void *pvParameters)
 
     static byte targetBrightness = 0;
     static float lux = 0;
-    static byte currentBrightness = 50;
+    static byte currentBrightness = 0;
     if (millis() - lastLightRead > lightInterval)
     {
       lastLightRead = millis();
@@ -389,13 +389,23 @@ void loop1(void *pvParameters)
       ESP.restart(); // Restart the microcontroller
     }
 
+    // ---- Background NTP Sync (every minute, silent, no display update) ----
+    if ((millis() - lastBackgroundNtpTime >= 60000) && WiFi.status() == WL_CONNECTED)
+    {
+      lastBackgroundNtpTime = millis();
+      Serial.println("[BACKGROUND] Attempting silent NTP sync...");
+      // Attempt sync without triggering display updates
+      rtcTimeUpdater();
+      skipNextJumpCheck = true; // Skip jump detection after background sync
+    }
+
     // Calculate how many days have passed since the last time sync.
     // Using the day-of-month value keeps this simple and avoids a full
     // date-time difference calculation.
     byte daysPassed = (currentDay - lastCheckedDay + 31) % 31;
 
     // If the clock was never synced, or five days have gone by, do an update.
-    if (timeNeedsUpdate || daysPassed >= 5)
+    if (timeNeedsUpdate || daysPassed >= 1)
     {
       timeNeedsUpdate = true; // Set this early to prevent multiple attempts in the same loop
       Serial.println("[INFO] Time update needed - attempting NTP sync");
@@ -421,75 +431,80 @@ void loop1(void *pvParameters)
 // RTC HELPER FUNCTIONS - Clean modular architecture
 // ============================================================================
 
-// Double-read validation: detects I2C corruption
-DateTime doubleReadRTC()
+// System time validation: check time consistency
+time_t doubleReadRTC()
 {
-  DateTime now1 = rtc.now();
+  time_t now1 = getCurrentTime();
   delay(5);
-  DateTime now2 = rtc.now();
+  time_t now2 = getCurrentTime();
 
   // Check if the two reads differ by more than 2 seconds
-  if (abs((long)(now2.unixtime() - now1.unixtime())) > 2)
+  if (abs((long)(now2 - now1)) > 2)
   {
-    Serial.println("[RTC_ERROR] Inconsistent I2C read detected");
-    Serial.print("[RTC_DEBUG] Read 1: ");
-    Serial.print(now1.unixtime());
+    Serial.println("[TIME_ERROR] Inconsistent time read detected");
+    Serial.print("[TIME_DEBUG] Read 1: ");
+    Serial.print(now1);
     Serial.print(" | Read 2: ");
-    Serial.println(now2.unixtime());
-    return DateTime(1); // Return invalid epoch (1970)
+    Serial.println(now2);
+    return 1; // Return invalid epoch (1970)
   }
 
-  return now2; // Use second read as it's more likely correct
+  return now2; // Use second read
 }
 
-// Basic range validation for all RTC fields
-bool basicRangeCheck(DateTime now)
+// Basic range validation for all time fields
+bool basicRangeCheck(time_t now)
 {
+  struct tm *timeinfo = localtime(&now);
+
   // Check hour (0-23)
-  if (now.hour() > 23)
+  if (timeinfo->tm_hour > 23)
   {
-    Serial.print("[RTC_ERROR] Invalid hour: ");
-    Serial.println(now.hour());
+    Serial.print("[TIME_ERROR] Invalid hour: ");
+    Serial.println(timeinfo->tm_hour);
     return false;
   }
 
   // Check minute (0-59)
-  if (now.minute() > 59)
+  if (timeinfo->tm_min > 59)
   {
-    Serial.print("[RTC_ERROR] Invalid minute: ");
-    Serial.println(now.minute());
+    Serial.print("[TIME_ERROR] Invalid minute: ");
+    Serial.println(timeinfo->tm_min);
     return false;
   }
 
   // Check second (0-59)
-  if (now.second() > 59)
+  if (timeinfo->tm_sec > 59)
   {
-    Serial.print("[RTC_ERROR] Invalid second: ");
-    Serial.println(now.second());
+    Serial.print("[TIME_ERROR] Invalid second: ");
+    Serial.println(timeinfo->tm_sec);
     return false;
   }
 
   // Check day (1-31)
-  if (now.day() < 1 || now.day() > 31)
+  int day = timeinfo->tm_mday;
+  if (day < 1 || day > 31)
   {
-    Serial.print("[RTC_ERROR] Invalid day: ");
-    Serial.println(now.day());
+    Serial.print("[TIME_ERROR] Invalid day: ");
+    Serial.println(day);
     return false;
   }
 
   // Check month (1-12)
-  if (now.month() < 1 || now.month() > 12)
+  int month = timeinfo->tm_mon + 1;
+  if (month < 1 || month > 12)
   {
-    Serial.print("[RTC_ERROR] Invalid month: ");
-    Serial.println(now.month());
+    Serial.print("[TIME_ERROR] Invalid month: ");
+    Serial.println(month);
     return false;
   }
 
   // Check year (2026-2100)
-  if (now.year() < 2026 || now.year() > 2100)
+  int year = timeinfo->tm_year + 1900;
+  if (year < 2026 || year > 2100)
   {
-    Serial.print("[RTC_ERROR] Invalid year: ");
-    Serial.println(now.year());
+    Serial.print("[TIME_ERROR] Invalid year: ");
+    Serial.println(year);
     return false;
   }
 
@@ -505,8 +520,8 @@ bool rtcSanityCheck()
   static long lastUnix = 0;
   static bool firstCheck = true;
 
-  // Get RTC time with double-read validation
-  DateTime now = doubleReadRTC();
+  // Get system time with validation
+  time_t now = doubleReadRTC();
 
   // Basic range check on all fields
   if (!basicRangeCheck(now))
@@ -517,13 +532,12 @@ bool rtcSanityCheck()
   // Jump detection (only after first check AND not skipping due to recent sync)
   if (!firstCheck && !skipNextJumpCheck)
   {
-    long currentUnix = now.unixtime();
-    long timeDiff = currentUnix - lastUnix;
+    long timeDiff = now - lastUnix;
 
     // Allow up to 2 minutes (120 seconds) between checks
     if (timeDiff < 0 || timeDiff > 120)
     {
-      Serial.print("[RTC_ERROR] Abnormal time jump: ");
+      Serial.print("[TIME_ERROR] Abnormal time jump: ");
       Serial.print(timeDiff);
       Serial.println(" sec");
       return false;
@@ -537,16 +551,16 @@ bool rtcSanityCheck()
   }
 
   // Update baseline for next check
-  lastUnix = now.unixtime();
+  lastUnix = now;
   firstCheck = false;
 
   return true;
 }
 
 // ============================================================================
-// WiFi SIGNAL DISPLAY - Update WiFi signal indicator only when signal changes
+// WiFi SIGNAL DISPLAY - Update WiFi signal indicator
 // ============================================================================
-// Returns true if the signal strength changed and was redrawn
+// Always displays WiFi signal strength
 bool updateWiFiSignalDisplay()
 {
   // Calculate current signal strength
@@ -583,17 +597,7 @@ bool updateWiFiSignalDisplay()
     signalDots = 0;
   }
 
-  // Check if signal changed
-  if (lastSignalDots == signalDots && lastWifiColor == wifiColor)
-  {
-    return false; // No change, don't redraw
-  }
-
-  // Update tracking variables
-  lastSignalDots = signalDots;
-  lastWifiColor = wifiColor;
-
-  // Redraw WiFi signal indicator
+  // Always redraw WiFi signal indicator
   display.fillRect(50, 0, 24, 4, myBLACK);
   const byte dotSize = 2;
   const byte dotSpacing = 1;
@@ -604,7 +608,7 @@ bool updateWiFiSignalDisplay()
     display.fillRect(x, y, dotSize, dotSize, (dotIndex < signalDots) ? wifiColor : myBLACK);
   }
 
-  return true; // Signal changed and was redrawn
+  return true;
 }
 
 // ============================================================================
@@ -647,38 +651,41 @@ void loop()
     }
 
     // ---- Read and Format Time Data ----
-    DateTime now = rtc.now();
+    time_t nowTime = getCurrentTime();
+    struct tm *timeinfo = localtime(&nowTime);
 
     // ---- Sanity Check RTC Values ----
-    if (!rtcSanityCheck())
+    /*if (!rtcSanityCheck())
     {
-      // RTC corruption detected - attempt recovery
-      Serial.println("[RTC_RECOVERY] Starting recovery sequence...");
+      // Time corruption detected - attempt recovery
+      Serial.println("[TIME_RECOVERY] Starting recovery sequence...");
 
       if (rtcTimeUpdater())
       {
-        Serial.println("[RTC_RECOVERY] Time updated successfully");
+        Serial.println("[TIME_RECOVERY] Time updated successfully");
         skipNextJumpCheck = true; // Skip jump detection after successful recovery
         delay(500);
-        // ESP.restart();
       }
       else
       {
-        Serial.println("[RTC_RECOVERY] Update failed.");
+        Serial.println("[TIME_RECOVERY] Update failed.");
         delay(1000);
-        errorFlag = "RTC CORRUPT";
+        errorFlag = "TIME CORRUPT";
       }
-    }
+    }*/
 
-    byte tempHour = now.twelveHour(); // Get the hour in 12-hour format
+    // Calculate 12-hour format hour
+    int hour24 = timeinfo->tm_hour;
+    int tempHour = (hour24 == 0) ? 12 : (hour24 > 12) ? hour24 - 12
+                                                      : hour24;
 
-    currentDay = now.day();
+    currentDay = timeinfo->tm_mday;
 
     // ---- Trigger hourly alarm when hour changes ----
-    if (now.hour() != lastAlarmHour && now.minute() == 0 && now.second() == 0)
+    if (hour24 != lastAlarmHour && timeinfo->tm_min == 0 && timeinfo->tm_sec == 0)
     {
       hourlyAlarmTriggered = true;
-      lastAlarmHour = now.hour();
+      lastAlarmHour = hour24;
     }
 
     // Update WiFi signal display every 5 seconds (only redraws if signal changed)
@@ -689,22 +696,26 @@ void loop()
     }
 
     char dateString[12];
-    sprintf(dateString, "%02d/%02d/%04d", currentDay, now.month(), now.year());
+    sprintf(dateString, "%02d/%02d/%04d", currentDay, (timeinfo->tm_mon + 1), (timeinfo->tm_year + 1900));
 
     // ---- Update Display Every Minute ----
-    if (x || now.second() == 0)
+    if (x || timeinfo->tm_sec == 0)
     {
       x = false;
-      bool isPM = now.isPM();
+      bool isPM = (hour24 >= 12);
       bool hasError = errorFlag.length() > 0;
+      int displayMonth = (timeinfo->tm_mon + 1);
+      int displayYear = (timeinfo->tm_year + 1900);
+      int displayMinute = timeinfo->tm_min;
+      int displayDayOfWeek = timeinfo->tm_wday;
 
       // ---- Update Date Block (day/month/year) ----
-      if (lastDisplayedDay != currentDay || lastDisplayedMonth != now.month() || lastDisplayedYear != now.year())
+      if (lastDisplayedDay != currentDay || lastDisplayedMonth != displayMonth || lastDisplayedYear != displayYear)
       {
         lastDisplayedDay = currentDay;
-        lastDisplayedMonth = now.month();
-        lastDisplayedYear = now.year();
-        display.fillRect(0, 4, 64, 12, myBLACK);
+        lastDisplayedMonth = displayMonth;
+        lastDisplayedYear = displayYear;
+        display.fillRect(0, 4, 64, 13, myBLACK);
         display.setFont(NULL);
         display.setTextColor(myCYAN);
         display.setCursor(3, 10);
@@ -712,29 +723,29 @@ void loop()
       }
 
       // ---- Update Time Block (hour/minute/AM-PM) ----
-      if (lastDisplayedHour != tempHour || lastDisplayedMinute != now.minute() || lastDisplayedIsPM != isPM)
+      if (lastDisplayedHour != tempHour || lastDisplayedMinute != displayMinute || lastDisplayedIsPM != isPM)
       {
         lastDisplayedHour = tempHour;
-        lastDisplayedMinute = now.minute();
+        lastDisplayedMinute = displayMinute;
         lastDisplayedIsPM = isPM;
-        display.fillRect(0, 24, 64, 22, myBLACK);
+        display.fillRect(0, 17, 64, 30, myBLACK);
         display.setFont(&FreeSans9pt7b);
         display.setTextSize(1);
         display.setTextColor(myWHITE);
         display.setCursor(0, 37);
         display.print(padNum(tempHour));
         display.setCursor(26, 37);
-        display.print(padNum(now.minute()));
+        display.print(padNum(displayMinute));
         display.setFont(NULL);
         display.print(isPM ? " PM" : " AM");
       }
 
       // ---- Update Day and Temperature Block ----
-      if (lastDisplayedErrorFlag != hasError || lastDisplayedDayOfWeek != now.dayOfTheWeek() ||
+      if (lastDisplayedErrorFlag != hasError || lastDisplayedDayOfWeek != displayDayOfWeek ||
           lastDisplayedTempC != tempC || (tempC != -99.0f && (int)(lastDisplayedTempC * 10) != (int)(tempC * 10)))
       {
         lastDisplayedErrorFlag = hasError;
-        lastDisplayedDayOfWeek = now.dayOfTheWeek();
+        lastDisplayedDayOfWeek = displayDayOfWeek;
         lastDisplayedTempC = tempC;
         display.fillRect(0, 48, 64, 19, myBLACK);
 
@@ -748,7 +759,7 @@ void loop()
         {
           display.setTextColor(myMAGENTA);
           display.setCursor(3, 50);
-          display.print(daysOfTheWeek[now.dayOfTheWeek()]);
+          display.print(daysOfTheWeek[displayDayOfWeek]);
 
           if (tempC == -99.0f)
           {
@@ -828,12 +839,6 @@ void loop()
 
 bool rtcTimeUpdater()
 {
-  if (!rtc.begin())
-  {
-    Serial.println("[ERROR] RTC not found - cannot update time");
-    return false;
-  }
-
   // Early WiFi validation - check connection status first (WL_CONNECTED = 3)
   int wifiStatus = WiFi.status();
   if (wifiStatus != WL_CONNECTED)
@@ -916,19 +921,23 @@ bool rtcTimeUpdater()
     return false;
   }
 
-  // Update RTC with validated time
-  DateTime dt(rawtime);
-  rtc.adjust(dt);
+  // Update system time with validated NTP time
+  struct timeval tv;
+  tv.tv_sec = rawtime; // Unix timestamp in seconds
+  tv.tv_usec = 0;      // Microseconds
+  settimeofday(&tv, nullptr);
 
-  if (dt.year() < 2026)
+  // Verify the time was set
+  struct tm *dt = localtime(&rawtime);
+  if ((dt->tm_year + 1900) < 2026)
   {
-    Serial.println("Year check failed after RTC adjust. Retrying...");
+    Serial.println("Year check failed after time sync. Retrying...");
     return false;
   }
 
   char successMsg[150];
-  sprintf(successMsg, "[SUCCESS] RTC synced to: %04d-%02d-%02d %02d:%02d:%02d",
-          dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
+  sprintf(successMsg, "[SUCCESS] System time synced to: %04d-%02d-%02d %02d:%02d:%02d",
+          (dt->tm_year + 1900), (dt->tm_mon + 1), dt->tm_mday, dt->tm_hour, dt->tm_min, dt->tm_sec);
   Serial.println(successMsg);
   return true;
 }
