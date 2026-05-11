@@ -222,12 +222,15 @@ void loop1(void *pvParameters)
   for (;;)
   {
     // ---- Handle hourly alarm buzzer ----
-    if (hourlyAlarmTriggered && !isDark) // Only buzz if it's not dark (to avoid disturbing sleep)
+    if (hourlyAlarmTriggered)
     {
-      digitalWrite(buzzerPin, HIGH); // Buzzer on
-      delay(1000);                   // 1 second buzz
-      digitalWrite(buzzerPin, LOW);  // Buzzer off
-      hourlyAlarmTriggered = false;  // Reset flag
+      if (!isDark) // Only buzz if it's not dark
+      {
+        digitalWrite(buzzerPin, HIGH); // Buzzer on
+        delay(1000);                   // 1 second buzz
+        digitalWrite(buzzerPin, LOW);  // Buzzer off
+      }
+      hourlyAlarmTriggered = false; // Reset flag immediately (no defer)
     }
 
     // ---- Update stored WiFi RSSI every 5 seconds ----
@@ -717,7 +720,7 @@ void loop()
         lastDisplayedYear = displayYear;
         display.fillRect(0, 4, 64, 13, myBLACK);
         display.setFont(NULL);
-        display.setTextColor(myCYAN);
+        display.setTextColor(myORANGE);
         display.setCursor(3, 10);
         display.print(dateString);
       }
@@ -777,7 +780,7 @@ void loop()
             }
             else if (tempC < 29)
             {
-              tempColor = myBLUE; // Blue for 29°C and below
+              tempColor = myCYAN; // Cyan for 29°C and below
             }
 
             display.setTextColor(tempColor);

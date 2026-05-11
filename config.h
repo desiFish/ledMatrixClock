@@ -68,7 +68,7 @@ uint16_t myMAGENTA = display.color565(255, 0, 255);
 uint16_t myBLACK = display.color565(0, 0, 0);
 
 // Additional colors for variety
-uint16_t myORANGE = display.color565(255, 165, 0);      // Orange
+uint16_t myORANGE = display.color565(255, 140, 0);      // Strong orange
 uint16_t myLIME = display.color565(0, 255, 0);          // Lime Green (bright green)
 uint16_t myPURPLE = display.color565(128, 0, 128);      // Purple
 uint16_t myPINK = display.color565(255, 105, 180);      // Hot Pink
@@ -149,8 +149,8 @@ bool timeNeedsUpdate = false;
 String errorFlag = "";
 byte currentDay = 0;
 byte lastCheckedDay = 0;
-unsigned long lastBackgroundNtpTime = 0;  // Track last background NTP sync time
-bool x = true; // Used to force display refresh when time sync status changes
+unsigned long lastBackgroundNtpTime = 0; // Track last background NTP sync time
+bool x = true;                           // Used to force display refresh when time sync status changes
 
 // ============================================================================
 // UTILITY FUNCTIONS
