@@ -142,7 +142,7 @@ TaskHandle_t loop1Task;
 // ============================================================================
 
 // Software version for beta builds
-#define SW_VERSION "1.1.0-beta"
+#define SW_VERSION "1.2.1-beta"
 
 // Flags and counters that track application state across the sketch
 bool timeNeedsUpdate = false;
